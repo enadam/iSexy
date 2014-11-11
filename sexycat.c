@@ -246,8 +246,8 @@ struct endpoint_st
 		char const *fname;
 
 		struct
-		{	/* Order is important, $url must be
-			 * the first member of the structure. */
+		{	/* Order is important, $url must be the first
+			   member of the structure (XXX why?). */
 			struct iscsi_url *url;
 
 			/* The $initiator name to use for log in to $url. */
@@ -261,9 +261,9 @@ struct endpoint_st
 	 */
 	struct iscsi_context *iscsi;
 
-	/* Designates the current maximum number of parallel write requests,
+	/* Designates the current maximum number of parallel iSCSI requests,
 	 * which may be decreased by $Opt_maxreqs_degradation.  Zero in case
-	 * of local output. */
+	 * of local input/output. */
 	unsigned maxreqs;
 
 	/* The destination's block size if it's an iSCSI device, otherwise
@@ -315,7 +315,7 @@ struct chunk_st
 
 	/* The data carried by this chunk.  When the source is local,
 	 * the input buffer is allocated together with the chunk_st.
-	 * $wbuf is used by sexywrapper. */
+	 * $wbuf is used by sexywrap. */
 	union
 	{
 		void *wbuf;
@@ -1112,7 +1112,7 @@ int restart_requests(struct input_st *input,
 				dst->iscsi, dst->url->lun,
 				buf, sbuf, chunk->srcblock, 0, 0,
 				dst->blocksize, write_cb, chunk))
-			{	/* Incorrectible error. */
+			{	/* Uncorrectable error. */
 				warn_iscsi("write10", dst->iscsi);
 				return 0;
 			} else
@@ -1432,6 +1432,7 @@ int stat_endpoint(struct endpoint_st *endp, char const *which)
 	} else if (task->status != SCSI_STATUS_GOOD
 		|| !(cap = scsi_datain_unmarshall(task)))
 	{
+		scsi_free_scsi_task(task);
 		warn_errno("readcapacity10");
 		return 0;
 	}
@@ -1442,8 +1443,8 @@ int stat_endpoint(struct endpoint_st *endp, char const *which)
 	if (endp->blocksize < 512)
 	{
 		if (Opt_verbosity > 0)
-			warn("%s target reported blocksize=0, ignored",
-				which);
+			warn("%s target reported blocksize=%u, ignored",
+				which, endp->blocksize);
 		endp->blocksize = 512;
 	}
 	endp->nblocks = cap->lba + 1;
@@ -1461,26 +1462,25 @@ int stat_endpoint(struct endpoint_st *endp, char const *which)
 		warn_iscsi("inquiry", endp->iscsi);
 		scsi_free_scsi_task(task);
 		return 0;
-	} else
-	{	/* Ensure: $blocksize <= $granuality <= $optimum <= $max */
+	} else if (inq->max_xfer_len > endp->blocksize
+		&& inq->opt_xfer_len > endp->blocksize)
+	{	/* Ensure $blocksize <= $granuality <= $optimum <= $max. */
 		unsigned max;
 
 		/* $max := max(FLOOR($max_xfer_len), $blocksize) */
 		max = inq->max_xfer_len;
 		max -= max % endp->blocksize;
-		if (!max)
-			max = endp->blocksize;
 
 		/* $granuality := max($blocksize*$opt_gran, $blocksize)
 		 * $granuality := min($granuality, $max) */
 		endp->granuality = endp->blocksize * inq->opt_gran;
 		if (!endp->granuality)
 			endp->granuality = endp->blocksize;
-		else if (max && endp->granuality > max)
+		else if (endp->granuality > max)
 			endp->granuality = max;
 
 		if (inq->opt_xfer_len)
-		{	/* Make $blocksize <= $optimum <= $max. */
+		{	/* Make sure $blocksize <= $optimum <= $max. */
 			unsigned rem;
 
 			/* $optimum := FLOOR($opt_xfer_len) */
@@ -1491,7 +1491,7 @@ int stat_endpoint(struct endpoint_st *endp, char const *which)
 			 * max($optimum) <- $max */
 			if (!endp->optimum)
 				endp->optimum = endp->blocksize;
-			else if (max && endp->optimum > max)
+			else if (endp->optimum > max)
 				endp->optimum = max;
 
 			/* max($granuality) <- $optimum */
@@ -1580,7 +1580,7 @@ int local_to_remote(struct input_st *input)
 
 	eof = overflow = 0;
 	pfd[1].fd = iscsi_get_fd(dst->iscsi);
-	maxwrite = dst->blocksize * dst->nblocks;
+	maxwrite = (off_t)dst->blocksize * dst->nblocks;
 	for (;;)
 	{
 		int ret;
@@ -1671,7 +1671,7 @@ int local_to_remote(struct input_st *input)
 	if (overflow)
 	{
 		warn("only %ld bytes could be written",
-			dst->blocksize * dst->nblocks - maxwrite);
+			(off_t)dst->blocksize * dst->nblocks - maxwrite);
 		return 0;
 	} else
 		return 1;
