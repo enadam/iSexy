@@ -159,6 +159,7 @@
 #include <poll.h>
 #include <signal.h>
 
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 
@@ -467,6 +468,8 @@ static int stat_endpoint(struct endpoint_st *endp, char const *which);
 static int init_endpoint(struct endpoint_st *endp, char const *which,
 	char const *url);
 
+static int is_devnode(char const *fname);
+static int is_devnull(int fd);
 static int local_to_remote(struct input_st *input);
 static int remote_to_local(struct input_st *input, unsigned output_flags);
 static int remote_to_remote(struct input_st *input);
@@ -521,7 +524,7 @@ void warnv(char const *fmt, va_list *args)
 {
 #ifdef SEXYWRAP
 	/* It's possible, though unlikely that the program
-	 * we're preloaded to cleared $stderr. */
+	 * we're preloaded by cleared $stderr. */
 	if (!stderr)
 		return;
 #endif
@@ -593,7 +596,7 @@ void xrealloc(void *ptrp, size_t size)
 
 	ptr = *(void **)ptrp;
 	if (!(ptr = realloc(ptr, size)))
-		die("remalloc(%zu): %m", size);
+		die("realloc(%zu): %m", size);
 	*(void **)ptrp = ptr;
 }
 
@@ -723,7 +726,7 @@ int xpwritev(int fd, struct iovec *iov, unsigned niov, off_t offset, int seek)
 		}
 
 		/* We need to write more. */
-		iov->iov_len -= ret;
+		iov->iov_len  -= ret;
 		iov->iov_base += ret;
 	}
 }
@@ -832,7 +835,7 @@ int process_output_queue(int fd,
 	/*
 	 * $niov	:= the number of buffers in the current batch
 	 * $first	:= the first block in the batch; if it's
-	 *		   $output->top_block, then the bathc can be flushed
+	 *		   $output->top_block, then the batch can be flushed
 	 *		   without seeking
 	 * $block	:= the next block we expect in the batch
 	 * $tasks	:= where to take from the next buffer of the batch
@@ -907,16 +910,17 @@ int process_output_queue(int fd,
 			return 1;
 
 		/* Write the buffers to $fd. */
-		if (!xpwritev(fd, output->iov, niov, dst->blocksize * first,
+		if (!xpwritev(fd, output->iov, niov,
+				(off_t)dst->blocksize * first,
 				need_to_seek))
 			die("%s: %m", dst->fname ? dst->fname : "(stdout)");
 
 		/* Delete output buffers. */
 		for (t = from_task; t < tasks; t++)
 			scsi_free_scsi_task(*t);
-		memmove(from_task, tasks,
-			sizeof(*tasks) * (tasks - from_task));
-		output->enqueued = ntasks;
+		memmove(from_task, tasks, sizeof(*tasks) * ntasks);
+		output->enqueued -= tasks - from_task;
+		tasks = from_task;
 
 		/* If we've flushed the first possible batch, update
 		 * $output->top_block, which then will point to the start
@@ -1168,7 +1172,7 @@ int start_iscsi_read_requests(struct input_st *input, callback_t read_cb)
 		/* Detach $chunk from $input->unused. */
 		input->nreqs++;
 		take_chunk(chunk);
-	} /* read until there are no $input->unused chunks left */
+	} /* read until no more $input->unused chunks left */
 
 	return 1;
 }
@@ -1527,6 +1531,34 @@ int init_endpoint(struct endpoint_st *endp, char const *which,
 }
 
 #ifdef SEXYCAT
+int is_devnode(char const *fname)
+{
+	struct stat st;
+
+	if (stat(fname, &st) < 0)
+		return 0;
+	return S_ISCHR(st.st_mode) || S_ISBLK(st.st_mode);
+}
+
+int is_devnull(int fd)
+{
+	struct stat st1, st2;
+
+	if (fstat(fd, &st1) < 0)
+		return 0;
+	if (!S_ISCHR(st1.st_mode))
+		return 0;
+
+	if (stat("/dev/null", &st2) == 0 && S_ISCHR(st2.st_mode)
+			&& st1.st_rdev == st2.st_rdev)
+		return 1;
+	if (stat("/dev/zero", &st2) == 0 && S_ISCHR(st2.st_mode)
+			&& st1.st_rdev == st2.st_rdev)
+		return 1;
+
+	return 0;
+}
+
 int local_to_remote(struct input_st *input)
 {
 	off_t maxwrite;
@@ -1657,7 +1689,10 @@ int remote_to_local(struct input_st *input, unsigned output_flags)
 	{	/* Output is stdout. */
 		dst->fname = NULL;
 		pfd[1].fd = STDOUT_FILENO;
-	} else if ((pfd[1].fd = open(dst->fname, output_flags, 0666)) < 0)
+	} else if ((pfd[1].fd = open(dst->fname, output_flags, 0666)) < 0
+		&& (errno != EEXIST || !is_devnode(dst->fname)
+			|| (pfd[1].fd = open(dst->fname,
+				output_flags & ~(O_CREAT|O_EXCL), 0666)) < 0))
 	{
 		warn_errno(dst->fname);
 		return 0;
@@ -1667,8 +1702,10 @@ int remote_to_local(struct input_st *input, unsigned output_flags)
 	 * In this case we need to allocate space for it, otherwise
 	 * it will return ESPIPE. */
 	dst->seekable = lseek(pfd[1].fd, 0, SEEK_CUR) != (off_t)-1;
-	if (dst->seekable && ftruncate(pfd[1].fd,
-		src->blocksize * src->nblocks) < 0)
+	if (dst->seekable
+		&& ftruncate(pfd[1].fd,
+			(off_t)src->blocksize * src->nblocks) < 0
+		&& (errno != EINVAL || !is_devnull(pfd[1].fd)))
 	{
 		warn_errno(dst->fname);
 		return 0;
