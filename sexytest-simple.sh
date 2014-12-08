@@ -18,6 +18,16 @@ url="$1";
 disk="$2";
 shift 2;
 
+if [ ! -x ./sexywrap ];
+then
+	echo "sexywrap is not available" >&2;
+	exit 1;
+elif [ ! -x ./sexytest-simple ];
+then
+	echo "sexytest-simple is not available" >&2;
+	exit 1;
+fi
+
 blocksize=`./sexywrap -N -s "$url" \
 	| sed -ne 's/source target: blocksize=\([0-9]\+\).*/\1/p'`;
 seq="512 1 2 3 5 12 123 511 513 1000 1023 1024 1025 1234";
