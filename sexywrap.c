@@ -1,5 +1,5 @@
 /*
- * sexywrap.c -- LD_PRELOAD:able library for transparent iSCSI support
+ * sexywrap.c -- LD_PRELOAD:able library for transparent iSCSI support {{{
  *
  * Provided functions: open(), close(), fstat(), lseek(), read(), write()
  *
@@ -18,14 +18,15 @@
  *
  * TODO	make the allocation of $Targets dynamic
  * TODO	support O_CLOEXEC in open() (possibly set it always)
+ * TODO	support individual initiator names per target;
+ *      maybe it should be encoded in the iscsi:// URL
  * TODO	provide pread(), pwrite() (don't forget *64())
  * TODO	provide stat(), lstat()
  * TODO	provide the dup*() functions; don't forget about fcntl(F_DUPFD)
- * TODO	support individual initiator names per target.  Maybe it should be
- *	encoded in the iscsi:// URL.
+ * }}}
  */
 
-/* Include sexycat.c */
+/* Include sexycat.c {{{ */
 /* We need types.h for off_t. */
 #define _GNU_SOURCE
 #include <sys/types.h>
@@ -34,16 +35,16 @@
 #include <unistd.h>
 #include <sys/syscall.h>
 
-/* These functions call the real syscalls, even though they aren't declared
- * in glibc. */
+/* These functions are not declared in glibc, but they exist and call
+ * the real syscalls. */
 extern int __open(char const *fname, int flags, ...);
 extern int __close(int fd);
 extern off_t __lseek(int fd, off_t offset, int whence);
 extern ssize_t __read(int fd, void *buf, size_t sbuf);
 extern ssize_t __write(int fd, void const *buf, size_t sbuf);
 
-/* We override these functions, but certainly we want sexycat to use
- * the native versions. */
+/* Provide sexycat.c with such definitions that point to the real syscalss,
+ * because we certainly want it to use them rather than our overrides. */
 #define SEXYWRAP
 #define open				__open
 #define dup(fd)				syscall(__NR_dup, fd)
@@ -62,8 +63,9 @@ extern ssize_t __write(int fd, void const *buf, size_t sbuf);
 #undef lseek
 #undef read
 #undef write
+/* #include sexycat.c }}} */
 
-/* Include files */
+/* Include files {{{ */
 #include <dlfcn.h>
 #include <pthread.h>
 
@@ -71,7 +73,29 @@ extern ssize_t __write(int fd, void const *buf, size_t sbuf);
 
 #include <linux/major.h>
 #include <linux/kdev_t.h>
+/* }}} */
 
+/* Private functions {{{ */
+/* Creating/finding/returning targets. */
+static struct target_st *is_target_unused(struct target_st *target);
+static struct target_st *find_unused_target(void);
+static struct target_st *find_target(int fd);
+static struct target_st *new_target(struct iscsi_context *iscsi);
+static void release_target(struct target_st *target);
+static int cleanup_target(struct target_st *target);
+
+/* The middleware between libiscsi and our read()/write() overrides. */
+static int get_roi(struct input_st *input, struct output_st *output,
+	struct endpoint_st *src, off_t position, size_t *sbufp);
+static int read_blocks(struct input_st *input, callback_t read_cb);
+static int write_blocks(struct input_st *input, scsi_block_addr_t from,
+	void const *buf, size_t min, size_t max);
+
+/* Utilities for the syscall overrides. */
+static int real_fxstat(int version, int fd, struct stat *sbuf);
+/* }}} */
+
+/* Private variables {{{ */
 static struct target_st
 {
 	pthread_mutex_t lock;
@@ -97,70 +121,82 @@ static struct target_st
 	{ PTHREAD_MUTEX_INITIALIZER },
 	{ PTHREAD_MUTEX_INITIALIZER },
 };
+/* }}} */
 
-/* Returns whether $target is opened.  If it's not, return it locked.
- * Note that pthread_mutex_trylock() will guaranteed to fail if _we_
- * (the current thread) have locked it. */
-static struct target_st *is_target_unused(struct target_st *target)
+/* Program code */
+/* Targets {{{ */
+/* Returns whether $target is opened.  If it's not, lock it and return. */
+struct target_st *is_target_unused(struct target_st *target)
 {
+	/* pthread_mutex_trylock() is guaranteed to fail if we,
+	 * the calling thread have locked it. */
 	if (pthread_mutex_trylock(&target->lock))
 		return NULL;
 	if (target->endp.url)
-	{
+	{	/* $url is not NULL, the $target is in use. */
 		pthread_mutex_unlock(&target->lock);
 		return NULL;
 	}
 
 	assert(!target->endp.iscsi || iscsi_get_fd(target->endp.iscsi) < 0);
 	return target;
-}
+} /* is_target_unused */
 
-/* Return a locked target which is not opened. */
-static struct target_st *find_unused_target(void)
+/* Return a target which isn't associated with a file descriptor (not opened).
+ * The returned target is locked. */
+struct target_st *find_unused_target(void)
 {
 	unsigned i;
 
+	/* Find an unused target in $Targets. */
 	for (i = 0; i < MEMBS_OF(Targets); i++)
 		if (is_target_unused(&Targets[i]))
 			return &Targets[i];
 
 	return NULL;
-}
+} /* find_unused_target */
 
 /*
  * Find an in-use target with $fd, and return NULL if none found.
+ * The returned target is locked.
+ *
  * Note that if there's a target with $fd but it's currently locked,
  * we won't find it.  This is intentional, since very likely we're
  * called from libiscsi, for which we don't want to proxy the calls
- * to ... libiscsi.
+ * to ... libiscsi.  On the other hand this makes it impossible to
+ * use the same $fd from different threads concurrently, which can
+ * be considered a limitation.
  */
-static struct target_st *find_target(int fd)
+struct target_st *find_target(int fd)
 {
 	unsigned i;
 
+	/* If we return NULL the call will be proxied to the real syscall,
+	 * which will handle this condition then. */
 	if (fd < 0)
 		return NULL;
 
+	/* Find $fd in $Targets. */
 	for (i = 0; i < MEMBS_OF(Targets); i++)
 	{
 		if (pthread_mutex_trylock(&Targets[i].lock))
 			continue;
 		if (Targets[i].endp.iscsi
-				&& iscsi_get_fd(Targets[i].endp.iscsi) == fd)
-		{
+			&& iscsi_get_fd(Targets[i].endp.iscsi) == fd)
+		{	/* We've found the corresponding target. */
 			assert(Targets[i].endp.url);
 			return &Targets[i];
 		}
 		pthread_mutex_unlock(&Targets[i].lock);
-	}
+	} /* for all @Targets */
 
 	return NULL;
-}
+} /* find_target */
 
 /* Return a possibly newly allocated struct target_st.  If an already
  * existing structure is chosen, its ->iscsi is destroyed and overridden
- * by $iscsi. */
-static struct target_st *new_target(struct iscsi_context *iscsi)
+ * by $iscsi.  The returned $target is locked. */
+struct target_st *new_target(struct iscsi_context *iscsi)
 {
 	struct target_st *target;
 
@@ -173,26 +209,28 @@ static struct target_st *new_target(struct iscsi_context *iscsi)
 			target->endp.iscsi = iscsi;
 		}
 		return target;
-	}
+	} /* an unused $target is found */
 
+	/* Out of $Targets. */
 	errno = EMFILE;
 	return NULL;
-}
+} /* new_target */
 
-/* Preserve $errno. */
-static void release_target(struct target_st *target)
+/* Lift the lock from $target, so it can be used by another function.
+ * $errno is preserved. */
+void release_target(struct target_st *target)
 {
 	int serrno = errno;
 	pthread_mutex_unlock(&target->lock);
 	errno = serrno;
-}
+} /* release_target */
 
 /*
  * Log out (if logged in) and disconnect (if connected) $target->iscsi.
  * $target is expected to be locked, and will be unlocked at the end.
  * The libiscsi context is not destroyed and can be reused.
  */
-static int cleanup_target(struct target_st *target)
+int cleanup_target(struct target_st *target)
 {
 	int ret;
 	struct iscsi_context *iscsi;
@@ -220,9 +258,160 @@ static int cleanup_target(struct target_st *target)
 
 	release_target(target);
 	return ret;
-}
+} /* cleanup_target */
+/* targets }}} */
 
-static int write_blocks(struct input_st *input, scsi_block_addr_t from,
+/* Middleware between libiscsi and read()/write(). {{{ */
+/*
+ * Initialize $input with $output and $endp, verify that at least part
+ * of the requested region [$position..$position+*$sbufp[ is within the
+ * limits of $endp, and figure out the corresponding block numbers (RoI)
+ * [$input->top_block..$input->until] which covers the requested region.
+ *
+ * If *$sbufp == 0 or $position is off the limits of $endp, *$sbufp is
+ * set to/left 0 and 0 is returned.  Otherwise *$sbufp is reduced to > 0
+ * as necessary.  On error 0 is returned and $errno is set.  Otherwise
+ * true is returned.
+ */
+int get_roi(struct input_st *input, struct output_st *output,
+	struct endpoint_st *endp, off_t position, size_t *sbufp)
+{
+	off_t n;
+	size_t sbuf;
+	scsi_block_addr_t lba;
+	scsi_block_count_t nblocks;
+
+	/* Don't exercise ourselves unnecessarily if the user specified
+	 * zero buffer size. */
+	if (!*sbufp)
+		return 0;
+	sbuf = *sbufp;
+
+	/* Check the file position. */
+	n = (off_t)endp->blocksize * endp->nblocks;
+	if (position < n)
+	{	/* OK, we're within bounds.  Let's check the max $sbuf. */;
+		n -= position;
+		if (sbuf > n)
+			/* We can only r/w up to (disk size ($n) - $position)
+			 * bytes, so let's reduce $sbuf. */
+			sbuf = n;
+		assert(sbuf > 0);
+	} else	/* End of file reached. */
+	{
+		*sbufp = 0;
+		return 0;
+	}
+
+	/* Prepare $input for reading from $endp. */
+	memset(output, 0, sizeof(*output));
+	if (!init_input(input, output, endp, NULL))
+		/* $errno is set */
+		return 0;
+
+	/*
+	 * Calculate the starting $lba and the $nblocks to r/w.
+	 *
+	 *                   n0|    n1     |            n2             |
+	 *                 +---v----------\+---------------------------.
+	 *                 |   |           |               |     m     |
+	 * |---blocksize---|---v-----------|---blocksize---|-----------v---|
+	 *                 /position                                   |
+	 *              lba    |                 sbuf                  |
+	 *                     `---------------------------------------/
+	 */
+	n = position % endp->blocksize;
+	lba = (position - n) / endp->blocksize;
+	nblocks = 1;
+	n = endp->blocksize - n;
+	if (sbuf > n)
+	{	/* We'll need to r/w more than one blocks. */
+		size_t m;
+
+		n = sbuf - n;
+		m = n % endp->blocksize;
+		nblocks += (n - m) / endp->blocksize;
+		if (m > 0)
+			/* We'll need to read a last partial block. */
+			nblocks++;
+	}
+
+	/* Save the results. */
+	input->top_block = lba;
+	input->until = lba + nblocks;
+
+	/* Return the # of bytes that can effectively be read/written. */
+	*sbufp = sbuf;
+	return 1;
+} /* get_roi */
+
+/*
+ * This function drives libiscsi for our read() override.  Essentially
+ * it does the same as remote_to_local() in sexycat.c.  Reads $input->src
+ * until $input->until is reached, and calls $read_cb() for all received
+ * chunks.  Returns whether everything has gone well, and sets $errno if
+ * necessary.
+ */
+int read_blocks(struct input_st *input, callback_t read_cb)
+{
+	struct pollfd pfd;
+	struct endpoint_st *src = input->src;
+
+	/* Loop until we're out of read requests. */
+	assert(!input->failed);
+	assert(input->unused && input->nunused);
+	pfd.fd = iscsi_get_fd(src->iscsi);
+	for (;;)
+	{
+		int ret;
+
+		/* (Re)create the iSCSI read requests and return
+		 * if none needed. */
+		if (!restart_requests(input, read_cb, NULL))
+			goto enomem;
+		if (!start_iscsi_read_requests(input, read_cb))
+			goto enomem;
+		if (!input->nreqs && !input->failed)
+			return 1;
+
+		/* Wait for input. */
+		pfd.events = iscsi_which_events(src->iscsi);
+		if ((ret = xfpoll(&pfd, 1, input)) < 0)
+			return 0;
+		else if (!ret)
+			continue;
+
+		/* (Re)send the iSCSI read requests. */
+		if (!is_connection_error(src->iscsi, NULL, pfd.revents))
+		{
+			if (!run_iscsi_event_loop(src->iscsi, pfd.revents))
+				goto eio;
+		} else
+		{	/* Connection problem with $src, reconnect. */
+			if (!reconnect_endpoint(src))
+				goto eio;
+			reduce_maxreqs(src, NULL);
+			free_surplus_unused_chunks(input);
+		}
+	} /* until $input->until is reached */
+
+	/* We ran into an error. */
+enomem:	errno = ENOMEM;
+	return 0;
+eio:	errno = EIO;
+	return 0;
+} /* read_blocks */
+
+/*
+ * Write $buf to $input->dst starting $from block.  $buf is expected
+ * to be on block-boundary, and $min...$max bytes of it will be written,
+ * so it must be >= $max bytes large.
+ *
+ * At the moment $max is unused, but later we might choose to write larger
+ * chunks than the target device's block size if it indicated support for
+ * larger transfer sizes.
+ */
+int write_blocks(struct input_st *input, scsi_block_addr_t from,
 	void const *buf, size_t min, size_t max)
 {
 	size_t sbuf;
@@ -240,13 +429,14 @@ static int write_blocks(struct input_st *input, scsi_block_addr_t from,
 	assert(sbuf <= max);
 	assert(sbuf % dst->blocksize == 0);
 
+	/* Loop until $sbuf is entirely consumed. */
 	pfd.fd = iscsi_get_fd(dst->iscsi);
 	for (;;)
 	{
 		int ret;
 
-		/* Called when a chunk is/not written and places the chunk
-		 * in the failed list or returns it to the unused list. */
+		/* Called when a chunk is/not written and add it to
+		 * the failed list or returns it to the unused list. */
 		void write_cb(struct iscsi_context *iscsi, int status,
 			void *command_data, void *private_data)
 		{
@@ -270,12 +460,15 @@ static int write_blocks(struct input_st *input, scsi_block_addr_t from,
 			}
 		} /* write_cb */
 
+		/* Recreate failed iSCSI requests.
+		 * Return if the job is done. */
 		if (!restart_requests(input, NULL, write_cb))
 			goto enomem;
 		if (!sbuf && !input->output->nreqs && !input->failed)
 			return 1;
 
-		/* Add new write request if we can. */
+		/* Add new write request if we can ($input has $unused
+		 * chunks). */
 		if (sbuf > 0 && input->unused)
 		{
 			struct chunk_st *chunk;
@@ -292,10 +485,11 @@ static int write_blocks(struct input_st *input, scsi_block_addr_t from,
 				goto enomem;
 
 			input->output->nreqs++;
-			buf += dst->blocksize;
+			buf  += dst->blocksize;
 			sbuf -= dst->blocksize;
 		} /* request write */
 
+		/* Wait until output is possible without blocking. */
 		pfd.events = iscsi_which_events(dst->iscsi);
 		if ((ret = xfpoll(&pfd, 1, input)) < 0)
 			return 0;
@@ -303,7 +497,7 @@ static int write_blocks(struct input_st *input, scsi_block_addr_t from,
 			continue;
 
 		if (!is_connection_error(dst->iscsi, NULL, pfd.revents))
-		{
+		{	/* (Re)send the iSCSI write requests. */
 			if (!run_iscsi_event_loop(dst->iscsi, pfd.revents))
 				return 0;
 			free_surplus_unused_chunks(input);
@@ -314,164 +508,16 @@ static int write_blocks(struct input_st *input, scsi_block_addr_t from,
 			reduce_maxreqs(dst, NULL);
 			free_surplus_unused_chunks(input);
 		}
-	}
+	} /* until !$sbuf */
 
 enomem:	errno = ENOMEM;
 	return 0;
-}
+} /* write_blocks */
+/* libiscsi middleware }}} */
 
-static int read_blocks(struct input_st *input, callback_t read_cb)
-{
-	struct pollfd pfd;
-	struct endpoint_st *src = input->src;
-
-	assert(!input->failed);
-	assert(input->unused && input->nunused);
-	pfd.fd = iscsi_get_fd(src->iscsi);
-	for (;;)
-	{
-		int ret;
-
-		if (!restart_requests(input, read_cb, NULL))
-			goto enomem;
-		if (!start_iscsi_read_requests(input, read_cb))
-			goto enomem;
-		if (!input->nreqs && !input->failed)
-			return 1;
-
-		pfd.events = iscsi_which_events(src->iscsi);
-		if ((ret = xfpoll(&pfd, 1, input)) < 0)
-			return 0;
-		else if (!ret)
-			continue;
-
-		if (!is_connection_error(src->iscsi, NULL, pfd.revents))
-		{
-			if (!run_iscsi_event_loop(src->iscsi, pfd.revents))
-				goto eio;
-		} else
-		{
-			if (!reconnect_endpoint(src))
-				goto eio;
-			reduce_maxreqs(src, NULL);
-			free_surplus_unused_chunks(input);
-		}
-	}
-
-enomem:	errno = ENOMEM;
-	return 0;
-eio:	errno = EIO;
-	return 0;
-}
-
-static int prepare_read(struct input_st *input, struct output_st *output,
-	struct endpoint_st *src, off_t position, size_t *sbufp)
-{
-	off_t n;
-	size_t sbuf;
-	scsi_block_addr_t lba;
-	scsi_block_count_t nblocks;
-
-	/* Don't exercise ourselves unnecessarily if the caller didn't
-	 * really want to read. */
-	if (!*sbufp)
-		return 0;
-	sbuf = *sbufp;
-
-	/* Check the file position. */
-	n = src->blocksize * src->nblocks;
-	if (position < n)
-	{	/* OK, we're within bounds.  Let's check the max $sbuf. */;
-		n -= position;
-		if (sbuf > n)
-			/* We can't read > disk size - position bytes. */
-			sbuf = n;
-		assert(sbuf > 0);
-	} else	/* End of file reached. */
-	{
-		*sbufp = 0;
-		return 0;
-	}
-
-	/* Prepare $input for reading. */
-	memset(output, 0, sizeof(*output));
-	if (!init_input(input, output, src, NULL))
-		/* $errno is set */
-		return 0;
-
-	/* Calculate from which $lba to read $nblocks from. */
-	n = position % src->blocksize;
-	lba = (position - n) / src->blocksize;
-	nblocks = 1;
-	n = src->blocksize - n;
-	if (sbuf > n)
-	{	/* We'll need to read more than one blocks. */
-		size_t m;
-
-		n = sbuf - n;
-		m = n % src->blocksize;
-		nblocks += (n - m) / src->blocksize;
-		if (m > 0)
-			/* We'll need to read a last partial block. */
-			nblocks++;
-	}
-
-	/* Settings for start_iscsi_read_requests(). */
-	input->top_block = lba;
-	input->until = lba + nblocks;
-
-	/* Return the number of bytes that can be read. */
-	*sbufp = sbuf;
-	return 1;
-}
-
-/* glibc doesn't provide a symbol for the real __fxstat(), so we need
- * to find it out with libdl. */
-static int real_fxstat(int version, int fd, struct stat *sbuf)
-{
-	static int use_fstat, use_fxstat;
-	static int (*libcs_fstat)(int, struct stat *);
-	static int (*libcs_fxstat)(int, int, struct stat *);
-
-	/* In theory NULL might be a valid function pointers (but I think,
-	 * if it were so, a lot of programs could be broken).  So be nice
-	 * and track the functions' availability with a different flag. */
-	if (use_fxstat)
-		return libcs_fxstat(version, fd, sbuf);
-	if (use_fstat)
-		return libcs_fstat(fd, sbuf);
-
-	/*
-	 * The way dlsym(3) proposes to resolve functions is not particularly
-	 * threading-friendly, but we can't help much: even if we protected
-	 * ourselves with a mutex, there could be other concurrent users of
-	 * libdl.
-	 */
-	dlerror();
-
-	/* Prefer __fxstat() because we have a $version number to honor. */
-	libcs_fxstat = dlsym(RTLD_NEXT, "__fxstat");
-	if (libcs_fxstat || !dlerror())
-	{
-		use_fxstat = 1;
-		return libcs_fxstat(version, fd, sbuf);
-	}
-
-	/* glibc doesn't even provide this function, but who knows
-	 * the mighty future. */
-	libcs_fstat = dlsym(RTLD_NEXT, "fstat");
-	if (libcs_fstat || !dlerror())
-	{
-		use_fstat = 1;
-		return libcs_fstat(fd, sbuf);
-	}
-
-	/* What da fakk.  We could invoke the syscall directly as
-	 * the very last resort, but at the moment I don't feel like it. */
-	errno = ENOSYS;
-	return -1;
-}
-
+/* libc overrides */
+/* open*(2) {{{ */
+/* O_ASYNC, O_NOCTTY and O_CREAT|O_EXCL flags are not supported. */
 int open(char const *fname, int flags, ...)
 {
 	char const *initiator;
@@ -508,6 +554,7 @@ int open(char const *fname, int flags, ...)
 	} else 
 		iscsi = target->endp.iscsi;
 
+	/* Try to parse $fname as an iscsi:// URL.  It might not be. */
 	assert(iscsi != NULL);
 	url = iscsi_parse_full_url(iscsi, fname);
 	if (target)
@@ -585,17 +632,18 @@ int open(char const *fname, int flags, ...)
 
 	release_target(target);
 	return iscsi_get_fd(iscsi);
-}
+} /* open */
 
+/* Just redirect to the open() function above.  I hope this works
+ * even on 32bit systems (ie. O_LARGEFILE shouldn't have effect). */
 int open64(char const *fname, int flags, ...)
 {
-	/* Just redirect to the open() function above.  I hope this works
-	 * even on 32bit systems (ie. O_LARGEFILE shouldn't have effect). */
 	if (flags & O_CREAT)
 	{
 		int ret;
 		va_list args;
 
+		/* Retrieve and pass on the permission bits. */
 		va_start(args, flags);
 		ret = open(fname, flags, va_arg(args, int));
 		va_end(args);
@@ -603,9 +651,10 @@ int open64(char const *fname, int flags, ...)
 		return ret;
 	} else
 		return open(fname, flags);
-}
+} /* open64 */
+/* open }}} */
 
-/* TODO Not implemented */
+/* dup*(2) TODO neither is implemented {{{ */
 int dup(int fd)
 {
 	struct target_st *target;
@@ -620,7 +669,6 @@ int dup(int fd)
 	return -1;
 }
 
-/* TODO Not implemented */
 int dup2(int oldfd, int newfd)
 {
 	struct target_st *target;
@@ -635,7 +683,6 @@ int dup2(int oldfd, int newfd)
 	return -1;
 }
 
-/* TODO Not implemented */
 int dup3(int oldfd, int newfd, int flags)
 {
 	struct target_st *target;
@@ -649,7 +696,9 @@ int dup3(int oldfd, int newfd, int flags)
 	errno = EINVAL;
 	return -1;
 }
+/* dup }}} */
 
+/* cleanup_target() the one associated with $fd. {{{ */
 int close(int fd)
 {
 	struct target_st *target;
@@ -658,7 +707,55 @@ int close(int fd)
 		return __close(fd);
 	else
 		return cleanup_target(target);
-}
+} /* close }}} */
+
+/* fstat(2): report the target as a block device {{{ */
+/* glibc doesn't provide a symbol for the real __fxstat(), so we need
+ * to find it out with libdl. */
+int real_fxstat(int version, int fd, struct stat *sbuf)
+{
+	static int use_fstat, use_fxstat;
+	static int (*libcs_fstat)(int, struct stat *);
+	static int (*libcs_fxstat)(int, int, struct stat *);
+
+	/* In theory NULL might be a valid function pointers (but I think,
+	 * if it were so, a lot of programs could be broken).  So be nice
+	 * and track the functions' availability with a different flag. */
+	if (use_fxstat)
+		return libcs_fxstat(version, fd, sbuf);
+	if (use_fstat)
+		return libcs_fstat(fd, sbuf);
+
+	/*
+	 * The way dlsym(3) proposes to resolve functions is not particularly
+	 * threading-friendly, but we can't help much: even if we protected
+	 * ourselves with a mutex, there could be other concurrent users of
+	 * libdl.
+	 */
+	dlerror();
+
+	/* Prefer __fxstat() because we have a $version number to honor. */
+	libcs_fxstat = dlsym(RTLD_NEXT, "__fxstat");
+	if (libcs_fxstat || !dlerror())
+	{
+		use_fxstat = 1;
+		return libcs_fxstat(version, fd, sbuf);
+	}
+
+	/* glibc doesn't even provide this function, but who knows
+	 * the mighty future. */
+	libcs_fstat = dlsym(RTLD_NEXT, "fstat");
+	if (libcs_fstat || !dlerror())
+	{
+		use_fstat = 1;
+		return libcs_fstat(fd, sbuf);
+	}
+
+	/* What da fakk.  We could invoke the syscall directly as
+	 * the very last resort, but at the moment I don't feel like it. */
+	errno = ENOSYS;
+	return -1;
+} /* real_fxstat */
 
 int __fxstat(int version, int fd, struct stat *sbuf)
 {
@@ -700,8 +797,10 @@ int __fxstat(int version, int fd, struct stat *sbuf)
 
 	release_target(target);
 	return 0;
-}
+} /* __fxstat */
+/* stat }}} */
 
+/* lseek(2): adjust $target->position {{{ */
 off_t lseek(int fd, off_t offset, int whence)
 {
 	off_t disksize;
@@ -733,7 +832,7 @@ einval:
 	release_target(target);
 	errno = EINVAL;
 	return -1;
-}
+} /* lseek */
 
 #ifdef __LP64__
 /* This case this is identical to lseek() so we can redirect to it.
@@ -743,21 +842,23 @@ off_t lseek64(int fd, off_t offset, int whence)
 	return lseek(fd, offset, whence);
 }
 #endif /* __LP64__ */
+/* seek }}} */
 
+/* read(2) {{{ */
 ssize_t read(int fd, void *buf, size_t sbuf)
 {
-	struct target_st *target;
+	int fatal;
 	struct input_st input;
 	struct output_st output;
 	scsi_block_addr_t first;
-	int fatal;
+	struct target_st *target;
 
 	/* Is it our call? */
 	if (!(target = find_target(fd)))
 		return __read(fd, buf, sbuf);
 
 	/* Check whether the file is open for reading.  This is probably
-	 * unnecessary because all files are open for reading, but let's
+	 * dead code because all files are open for reading, but let's
 	 * be pedantic. */
 	if (O_RDONLY && !(target->mode & (O_RDONLY|O_RDWR)))
 	{
@@ -767,9 +868,8 @@ ssize_t read(int fd, void *buf, size_t sbuf)
 	}
 
 	/* Return 0 if nothing should/could be read. */
-	if (!prepare_read(&input, &output, &target->endp,
-		target->position, &sbuf))
-	{	/* $errno is set by prepare_read() */
+	if (!get_roi(&input, &output, &target->endp, target->position, &sbuf))
+	{	/* $errno is set by get_roi(). */
 		release_target(target);
 		return sbuf > 0 ? -1 : 0;
 	} else
@@ -778,9 +878,8 @@ ssize_t read(int fd, void *buf, size_t sbuf)
 		first = input.top_block;
 	}
 
-	/* Called when a chunk of data is read by libiscsi.
-	 * It's purpose is to copy the received data to the
-	 * appropriate place of $buf. */
+	/* Called when a chunk of data is read by libiscsi.  Its purpose
+	 * is to copy the received data to the appropriate place of $buf. */
 	void read_cb(struct iscsi_context *iscsi, int status,
 		void *command_data, void *private_data)
 	{
@@ -799,7 +898,7 @@ ssize_t read(int fd, void *buf, size_t sbuf)
 
 		offset = target->position % target->endp.blocksize;
 		if (fatal)
-			/* Don't do anything. */;
+			/* Failed @fatal:ly earlier, don't do anything. */;
 		else if (is_iscsi_error(iscsi, task, "read10", status))
 		{	/* Re-read the chunk. */
 			scsi_free_scsi_task(task);
@@ -808,16 +907,26 @@ ssize_t read(int fd, void *buf, size_t sbuf)
 		} else if (chunk->srcblock > first)
 		{	/* $first < $chunk->srcblock < $first + $nblocks */
 			/* This chunk possibly includes the last block. */
-			/* $offset := where to copy */
+			/* $offset := where to copy in @buf */
 			offset  = target->endp.blocksize - offset;
 			offset += (chunk->srcblock - first - 1)
 				* target->endp.blocksize;
-			assert(offset < sbuf);
+
+			/*
+			 *  first     first+1 (=: srcblock)
+			 * /     blocksize   \/task->datain.data\
+			 * |--------v---------|======v===========|
+			 * |        |offset1/2|  n   |      first+2
+			 * v      ./+----------------+
+			 * offset0  |      sbuf      |
+			 *       position
+			 */
 
 			/* $n := the number of bytes to copy */
-			n = sbuf - offset;
-			if (n > task->datain.size)
-				n = task->datain.size;
+			assert(sbuf > offset);
+			n = sbuf > offset + task->datain.size
+				? task->datain.size
+				: sbuf - offset;
 			memcpy(buf+offset, task->datain.data, n);
 			input.nread += n;
 		} else if (task->datain.size > offset)
@@ -826,18 +935,15 @@ ssize_t read(int fd, void *buf, size_t sbuf)
 			assert(chunk->srcblock == first);
 
 			/* $n := the number of bytes to copy */
-			n = sbuf;
-			if (offset + n > task->datain.size)
-				n = task->datain.size - offset;
+			assert(offset < task->datain.size);
+			n = offset + sbuf > task->datain.size
+				? task->datain.size - offset
+				: sbuf;
 			memcpy(buf, &task->datain.data[offset], n);
 			input.nread += n;
-		} else
-			/*
-			 * Less than blocksize data returned.
-			 * This is a serious error and indicates
-			 * broken server, so let's consider this
-			 * a $fatal error.
-			 */
+		} else	/* Less than blocksize data returned.  This is
+			 * a serious error and indicates broken server,
+			 * so let's consider this a $fatal error. */
 			fatal = 1;
 
 		scsi_free_scsi_task(task);
@@ -859,8 +965,9 @@ ssize_t read(int fd, void *buf, size_t sbuf)
 	release_target(target);
 	done_input(&input);
 	return sbuf ? sbuf : -1;
-}
+} /* read }}} */
 
+/* write(2) {{{ */
 ssize_t write(int fd, void const *buf, size_t sbuf)
 {
 	struct target_st *target;
@@ -887,14 +994,14 @@ ssize_t write(int fd, void const *buf, size_t sbuf)
 		return 0;
 
 	/* Return ENOSPC if nothing could be written. */
-	if (!prepare_read(&input, &output, &target->endp,
-		target->position, &sbuf))
-	{
+	if (!get_roi(&input, &output, &target->endp, target->position, &sbuf))
+	{	/* If $sbuf > 0 $errno is set by get_roi(). */
 		if (!sbuf)
 			errno = ENOSPC;
 		return -1;
 	}
 
+	/* First we'll read $first, $second and $last, whichever is needed. */
 	from = input.top_block;
 	nblocks = input.until - from;
 	blocksize = target->endp.blocksize;
@@ -963,115 +1070,118 @@ ssize_t write(int fd, void const *buf, size_t sbuf)
 		return -1;
 	} /* clean_up */
 
-	// We have the following cases regarding $target->position, $sbuf
-	// and block boundaries:
-	//
-	////////////////////////////// CASE 1 ///////////////////////////////
-	//
-	//         position       sbuf
-	// -----|-----|=============|-------------------|
-	//    block               block               block
-	//
-	// $nblocks == 1
-	// $offset > 0 (head is unaligned)
-	// $sbuf < $blocksize
-	// $offset + $sbuf == $blocksize
-	// $first is used (request 1 block), $second and $last are unset
-	//
-	////////////////////////////// CASE 2 ///////////////////////////////
-	//
-	//   position       sbuf
-	// -----|=============|-----|-------------------|
-	//    block               block               block
-	//
-	// $nblocks == 1
-	// $offset == 0 (head is aligned)
-	// $sbuf < $blocksize, $offset + $sbuf < $blocksize
-	// $offset + $sbuf < $blocksize
-	// $first is used (request 1 block), $second and $last are unset
-	//
-	////////////////////////////// CASE 3 ///////////////////////////////
-	//
-	//         position              sbuf
-	// -----|-----|=============|======|------------|
-	//    block               block               block
-	//
-	// $nblocks == 2
-	// $offset > 0 (head is unaligned)
-	// $sbuf < $blocksize*2
-	// $blocksize < $offset + $sbuf < $blocksize*2
-	// ($sbuf - ($blocksize-$offset)) % $blocksize > 0 (tail is unaligned)
-	// $first is used (request 2 blocks),
-	// $second is used if sizeof($first) < $blocksize*2,
-	// $last is unset
-	//
-	////////////////////////////// CASE 4 ///////////////////////////////
-	//
-	//         position                           sbuf
-	// -----|-----|=============|===================|
-	//    block               block               block
-	//
-	// $nblocks == 2
-	// $offset > 0 (head is unaligned)
-	// $blocksize < $sbuf < $blocksize*2
-	// $offset + $sbuf == $blocksize*2
-	// ($sbuf - ($blocksize-$offset)) % $blocksize == 0 (tail is aligned)
-	// $first is used (request 1 block), $second and last are unset
-	// if sizeof($first) < $blocksize*2, bulk copy is used
-	// possible optimization: request $blocksize*2 for the $first chunk
-	// (at the moment $n blocks == $n requests)
-	//
-	////////////////////////////// CASE 5 ///////////////////////////////
-	//
-	//         position                                         sbuf
-	// -----|-----|=============|===================|=============|-----|
-	//    block               block               block               block
-	//
-	// $nblocks > 2
-	// $offset > 0 (head is unaligned)
-	// $sbuf > $blocksize
-	// $blocksize*2 < $offset + $sbuf < $blocksize*3
-	// ($sbuf - ($blocksize-$offset)) % $blocksize > 0 (tail is unaligned)
-	//   <=> ($offset + $sbuf) % $blocksize > 0
-	// $first is used (request 1 block), $second is unset, bulk copy is
-	// used, $last is used
-	// possible optimization: if $sbuf is not too large, read and write
-	// all the blocks with the $first chunk
-	//
-	////////////////////////////// CASES 6-7 ////////////////////////////
-	//
-	//   position                    sbuf
-	// -----|===================|======|------------|
-	//    block               block               block
-	//
-	//   position                                               sbuf
-	// -----|===================|===================|=============|-----|
-	//    block               block               block               block
-	//
-	// $nblocks > 1
-	// $offset == 0 (head is aligned)
-	// $sbuf > $blocksize
-	// ($sbuf - ($blocksize-$offset)) % $blocksize > 0 (tail is unaligned)
-	//   <=> $sbuf % $blocksize > 0 <=> ($offset + $sbuf) % $blocksize > 0
-	// $first and second are unset, bulk copy is used, $last is used
-	// possible optimization: like above
-	//
-	////////////////////////////// CASES 8-9 ////////////////////////////
-	//
-	//   position             sbuf
-	// -----|===================|-------------------|
-	//    block               block               block
-	//
-	//   position                                 sbuf
-	// -----|===================|===================|
-	//    block               block               block
-	//
-	// $nblocks can be anything
-	// $offset == 0 (head is aligned)
-	// $sbuf >= $blocksize
-	// ($sbuf - ($blocksize-$offset)) % $blocksize == 0 (tail is aligned)
-	//   <=> $sbuf % $blocksize == 0 <=> ($offset+$sbuf) % $blocksize == 0
-	// $first, $second and $last are unset, bulk copy is used
+	/*
+	 * We have the following cases regarding $target->position, {{{
+	 * $sbuf and block boundaries:
+	 *
+	 * /////////////////////////// CASE 1 //////////////////////////////
+	 *
+	 *         position       sbuf
+	 * -----|-----|=============|-------------------|
+	 *    block               block               block
+	 *
+	 * $nblocks == 1
+	 * $offset > 0 (head is unaligned)
+	 * $sbuf < $blocksize
+	 * $offset + $sbuf == $blocksize
+	 * $first is used (request 1 block), $second and $last are unset
+	 *
+	 * /////////////////////////// CASE 2 //////////////////////////////
+	 *
+	 *   position       sbuf
+	 * -----|=============|-----|-------------------|
+	 *    block               block               block
+	 *
+	 * $nblocks == 1
+	 * $offset == 0 (head is aligned)
+	 * $sbuf < $blocksize, $offset + $sbuf < $blocksize
+	 * $offset + $sbuf < $blocksize
+	 * $first is used (request 1 block), $second and $last are unset
+	 *
+	 * /////////////////////////// CASE 3 //////////////////////////////
+	 *
+	 *         position              sbuf
+	 * -----|-----|=============|======|------------|
+	 *    block               block               block
+	 *
+	 * $nblocks == 2
+	 * $offset > 0 (head is unaligned)
+	 * $sbuf < $blocksize*2
+	 * $blocksize < $offset + $sbuf < $blocksize*2
+	 * ($sbuf - ($blocksize-$offset)) % $blocksize > 0 (tail is unaligned)
+	 * $first is used (request 2 blocks),
+	 * $second is used if sizeof($first) < $blocksize*2,
+	 * $last is unset
+	 *
+	 * /////////////////////////// CASE 4 //////////////////////////////
+	 *
+	 *         position                           sbuf
+	 * -----|-----|=============|===================|
+	 *    block               block               block
+	 *
+	 * $nblocks == 2
+	 * $offset > 0 (head is unaligned)
+	 * $blocksize < $sbuf < $blocksize*2
+	 * $offset + $sbuf == $blocksize*2
+	 * ($sbuf - ($blocksize-$offset)) % $blocksize == 0 (tail is aligned)
+	 * $first is used (request 1 block), $second and last are unset
+	 * if sizeof($first) < $blocksize*2, bulk copy is used
+	 * possible optimization: request $blocksize*2 for the $first chunk
+	 * (at the moment $n blocks == $n requests)
+	 *
+	 * /////////////////////////// CASE 5 //////////////////////////////
+	 *
+	 *         position                                         sbuf
+	 * -----|-----|=============|===================|=============|-----|
+	 *    block               block               block               block
+	 *
+	 * $nblocks > 2
+	 * $offset > 0 (head is unaligned)
+	 * $sbuf > $blocksize
+	 * $blocksize*2 < $offset + $sbuf < $blocksize*3
+	 * ($sbuf - ($blocksize-$offset)) % $blocksize > 0 (tail is unaligned)
+	 *   <=> ($offset + $sbuf) % $blocksize > 0
+	 * $first is used (request 1 block), $second is unset, bulk copy is
+	 * used, $last is used
+	 * possible optimization: if $sbuf is not too large, read and write
+	 * all the blocks with the $first chunk
+	 *
+	 * /////////////////////////// CASES 6-7 ///////////////////////////
+	 *
+	 *   position                    sbuf
+	 * -----|===================|======|------------|
+	 *    block               block               block
+	 *
+	 *   position                                               sbuf
+	 * -----|===================|===================|=============|-----|
+	 *    block               block               block               block
+	 *
+	 * $nblocks > 1
+	 * $offset == 0 (head is aligned)
+	 * $sbuf > $blocksize
+	 * ($sbuf - ($blocksize-$offset)) % $blocksize > 0 (tail is unaligned)
+	 *   <=> $sbuf % $blocksize > 0 <=> ($offset + $sbuf) % $blocksize > 0
+	 * $first and second are unset, bulk copy is used, $last is used
+	 * possible optimization: like above
+	 *
+	 * /////////////////////////// CASES 8-9 ///////////////////////////
+	 *
+	 *   position             sbuf
+	 * -----|===================|-------------------|
+	 *    block               block               block
+	 *
+	 *   position                                 sbuf
+	 * -----|===================|===================|
+	 *    block               block               block
+	 *
+	 * $nblocks can be anything
+	 * $offset == 0 (head is aligned)
+	 * $sbuf >= $blocksize
+	 * ($sbuf - ($blocksize-$offset)) % $blocksize == 0 (tail is aligned)
+	 *   <=> $sbuf % $blocksize == 0 <=> ($offset+$sbuf) % $blocksize == 0
+	 * $first, $second and $last are unset, bulk copy is used
+	 * }}}
+	 */
 
 	/* Get $first and possibly $second for cases 1-5. */
 	assert(nblocks > 0);
@@ -1111,7 +1221,7 @@ ssize_t write(int fd, void const *buf, size_t sbuf)
 			return clean_up(errno);
 
 		if (nblocks == 2)
-		{	/* read_cb() mistook $second for $last. */
+		{	/* read_cb() must have mistaken $second for $last. */
 			assert(second && !last);
 			last = second;
 			second = NULL;
@@ -1162,8 +1272,8 @@ ssize_t write(int fd, void const *buf, size_t sbuf)
 			&& offset + sbuf+n < blocksize*2
 			&& first->datain.size < blocksize*2)
 		{	/* $second should be large enough for the remains
-			   of $buf.  Copy the remaining $buf to the head
-			   of $second. */
+			 * of $buf.  Copy the remaining $buf to the head
+			 * of $second. */
 			assert(second);
 			assert(0 < sbuf && sbuf < blocksize);
 			assert(sbuf < second->datain.size);
@@ -1208,6 +1318,7 @@ success:
 	clean_up(0);
 	target->position += cnt;
 	return cnt;
-}
+} /* write }}} */
 
+/* vim: set foldmethod=marker foldmarker={{{,}}}: */
 /* End of sexywrap.c */
