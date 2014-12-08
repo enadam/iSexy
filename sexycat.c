@@ -115,7 +115,8 @@
  * (This could be improved in the future.)  Requests are sent parallel,
  * with a backoff strategy if the server feels overloaded.
  *
- * TODO query and make use of the server's maximal/optimal chunk size
+ * TODO query and make use of the server's optimal chunk size
+ * TODO allow specification of offset and nblocks
  * TODO full documentation
  *
  * Dependecies: libiscsi 1.4
@@ -238,16 +239,17 @@ typedef unsigned scsi_block_count_t;
 typedef void (*callback_t)(struct iscsi_context *iscsi, int status,
 	void *command_data, void *private_data);
 
-/* Represents an iSCSI source or destination target. */
+/* Represents an iSCSI/local source/destination. */
 struct endpoint_st
 {
 	union
 	{
+		/* Input/output file name if the endpoint is local. */
 		char const *fname;
 
 		struct
-		{	/* Order is important, $url must be the first
-			   member of the structure (XXX why?). */
+		{	/* Order is important, $url must be the first member
+			   of the structure; see destroy_endpoint() why. */
 			struct iscsi_url *url;
 
 			/* The $initiator name to use for log in to $url. */
@@ -379,7 +381,8 @@ struct input_st
 	 * input is a local file. */
 	scsi_block_addr_t top_block, until;
 
-	/* The number of bytes that has been read. */
+	/* The number of bytes that has been read.  Only used to verify
+	 * that the expected amount has been read by remote_to_*(). */
 	off_t nread;
 
 	/*
@@ -387,9 +390,10 @@ struct input_st
 	 * $nunused is the number of chunks in the list; it's only used
 	 * by free_surplus_unused_chunks().
 	 *
-	 * $failed is a list of chunks whose reading or writing failed
+	 * $failed is a list of chunks whose reading _or_ writing failed
 	 * and needs to be retried.  $last_failed points to the last
-	 * element of the list; it's only used by restart_requests().
+	 * element of the list; it's only used by chunk_failed() in order
+	 * to be able to append a new chunk to the end of of list quickly.
 	 */
 	unsigned nunused;
 	struct chunk_st *unused;
@@ -468,8 +472,6 @@ static int stat_endpoint(struct endpoint_st *endp, char const *which);
 static int init_endpoint(struct endpoint_st *endp, char const *which,
 	char const *url);
 
-static int is_devnode(char const *fname);
-static int is_devnull(int fd);
 static int local_to_remote(struct input_st *input);
 static int remote_to_local(struct input_st *input, unsigned output_flags);
 static int remote_to_remote(struct input_st *input);
@@ -636,7 +638,7 @@ int xfpoll(struct pollfd *pfd, unsigned npolls, struct input_st *input)
 		const unsigned ms_per_sec = 1000;
 		const unsigned long ns_per_ms = 1000000;
 
-		/* Measure the time beteen the entry and exit from poll() */
+		/* Measure the time between the entry and exit from poll() */
 		timeout = input->failed->time_to_retry;
 		clock_gettime(CLOCK_MONOTONIC, &from);
 		ret = poll(pfd, npolls, timeout);
@@ -644,9 +646,7 @@ int xfpoll(struct pollfd *pfd, unsigned npolls, struct input_st *input)
 		clock_gettime(CLOCK_MONOTONIC, &now);
 
 		/* $diff := $now - $from */
-		diff = (now.tv_sec - from.tv_sec) * ms_per_sec;
-		if (now.tv_nsec < from.tv_nsec)
-			diff += ms_per_sec;
+		diff  = (now.tv_sec  - from.tv_sec)  * ms_per_sec;
 		diff += (now.tv_nsec - from.tv_nsec) / ns_per_ms;
 
 		/* Subtract the elapsed time from all failed chunks. */
@@ -655,7 +655,7 @@ int xfpoll(struct pollfd *pfd, unsigned npolls, struct input_st *input)
 				chunk->time_to_retry -= diff;
 			else
 				chunk->time_to_retry = 0;
-	} while (ret < 0 && eintr);
+	} while (eintr);
 
 	return ret;
 }
@@ -737,13 +737,15 @@ int is_connection_error(struct iscsi_context *iscsi, char const *which,
 	int error;
 	socklen_t serror;
 
-	if (!(revents & (POLLERR|POLLHUP|POLLRDHUP)))
+	if (!(revents & (POLLNVAL|POLLERR|POLLHUP|POLLRDHUP)))
 		return 0;
 	if (!which)
 		return 1;
 
 	serror = sizeof(error);
-	if (!(revents & POLLERR))
+	if (revents & POLLNVAL)
+		warn("connection to iSCSI %s is closed unexpectedly", which);
+	else if (!(revents & POLLERR))
 		warn("iSCSI %s closed the connection", which);
 	else if (!getsockopt(iscsi_get_fd(iscsi), SOL_SOCKET, SO_ERROR,
 			&error, &serror) && error)
@@ -789,7 +791,7 @@ void add_output_chunk(struct chunk_st *chunk)
 	{
 		unsigned n;
 
-		/* We've used up all $output->tasks.  Allocate +25% */
+		/* We've used up all $output->tasks.  Allocate +25%. */
 		n = output->max + output->max/4;
 		xrealloc(&output->tasks, sizeof(*output->tasks) * n);
 		xrealloc(&output->iov, sizeof(*output->iov) * n);
@@ -804,7 +806,7 @@ void add_output_chunk(struct chunk_st *chunk)
 		if (LBA_OF(output->tasks[i-1]) < lba)
 			break;
 
-	/* Insert $chunk->read_task into $output->tasks. */
+	/* Insert $chunk->read_task into $output->tasks[$i]. */
 	memmove(&output->tasks[i+1], &output->tasks[i],
 		sizeof(*output->tasks) * (output->enqueued - i));
 	output->tasks[i] = chunk->read_task;
@@ -829,7 +831,7 @@ int process_output_queue(int fd,
 {
 	int need_to_seek;
 	unsigned niov, ntasks;
-	unsigned first, block;
+	scsi_block_addr_t first, block;
 	struct scsi_task **tasks, **from_task, **t;
 
 	/*
@@ -911,7 +913,7 @@ int process_output_queue(int fd,
 
 		/* Write the buffers to $fd. */
 		if (!xpwritev(fd, output->iov, niov,
-				(off_t)dst->blocksize * first,
+				(off_t)dst->blocksize * first, // OK
 				need_to_seek))
 			die("%s: %m", dst->fname ? dst->fname : "(stdout)");
 
@@ -929,8 +931,9 @@ int process_output_queue(int fd,
 			output->top_block = block;
 		first = block;
 
+		/* Keep $need_to_seek, because pwrite*() doesn't change
+		 * the file offset. */
 		niov = 0;
-		need_to_seek = 0;
 	} /* until all batches are output or skipped */
 
 	return 0;
@@ -1013,12 +1016,19 @@ void chunk_read(struct iscsi_context *iscsi, int status,
 	}
 
 	/* REMOTE_TO_REMOTE() */
+	if (!(chunk->input->output->nreqs < chunk->input->dst->maxreqs))
+	{	/* Maximum outstanding write requests reached,
+		 * write $chunk later. */
+		chunk_failed(chunk);
+		return;
+	}
+
 	assert(task->datain.size > 0);
-	assert(task->datain.size % dst->blocksize == 0);
+	assert(task->datain.size % dst->blocksize == 0); // OK
 	if (!iscsi_write10_task(
 		dst->iscsi, dst->url->lun,
 		task->datain.data, task->datain.size,
-		chunk->srcblock, 0, 0, dst->blocksize,
+		chunk->srcblock, 0, 0, dst->blocksize, // OK
 		chunk_written, chunk))
 	{
 		warn_iscsi("write10", dst->iscsi);
@@ -1043,8 +1053,6 @@ int restart_requests(struct input_st *input,
 	if (!(input->nreqs < src->maxreqs || output->nreqs < dst->maxreqs))
 		return 1;
 
-	/* We need to know the current time to tell whether a failed request
-	 * can be retried. */
 	prev = NULL;
 	do
 	{	/* As long as we have failed requests which have reached
@@ -1069,8 +1077,8 @@ int restart_requests(struct input_st *input,
 					chunk->srcblock);
 			if (!iscsi_read10_task(
 				src->iscsi, src->url->lun,
-				chunk->srcblock, src->blocksize,
-				src->blocksize, read_cb, chunk))
+				chunk->srcblock, src->blocksize, // TBD
+				src->blocksize, read_cb, chunk)) // OK
 			{	/* It must be some fatal error, eg. OOM. */
 				warn_iscsi("read10", src->iscsi);
 				return 0;
@@ -1119,16 +1127,16 @@ int restart_requests(struct input_st *input,
 				output->nreqs++;
 		}
 
-		/* Unlink $chunk from the failed chain and update $prev,
+		/* Unlink $chunk from the $failed chain and update $prev,
 		 * $input->failed and $input->last_failed. */
 		chunk->next = NULL;
-		if (chunk == input->failed)
-		{
-			assert(!prev);
+		if (!prev)
+		{	/* $chunk is the first in the list. */
+			assert(chunk == input->failed);
 			input->failed = next;
 		} else
 		{
-			assert(prev != NULL);
+			assert(chunk != input->failed);
 			prev->next = next;
 		}
 		if (chunk == input->last_failed)
@@ -1159,7 +1167,7 @@ int start_iscsi_read_requests(struct input_st *input, callback_t read_cb)
 				&& !(input->top_block % Opt_read_progress))
 			info("reading source block %u", input->top_block);
 
-		if (!iscsi_read10_task(
+		if (!iscsi_read10_task( // XXX check usage of blocksize
 			src->iscsi, src->url->lun,
 			input->top_block, src->blocksize,
 			src->blocksize, read_cb, chunk))
@@ -1257,17 +1265,20 @@ void return_chunk(struct chunk_st *chunk)
 
 void take_chunk(struct chunk_st *chunk)
 {
-	assert(chunk->input->nunused > 0);
-	chunk->input->nunused--;
-	chunk->input->unused = chunk->next;
+	struct input_st *input = chunk->input;
+
+	assert(chunk == input->unused);
+	assert(input->nunused > 0);
+	input->nunused--;
+	input->unused = chunk->next;
 	chunk->next = NULL;
 }
 
+/* Append $chunk to $input->failed. */
 void chunk_failed(struct chunk_st *chunk)
 {
 	struct input_st *input = chunk->input;
 
-	/* Append $chunk to $input->failed. */
 	assert(!chunk->next);
 
 	if (!input->failed)
@@ -1285,7 +1296,7 @@ void chunk_failed(struct chunk_st *chunk)
 	chunk->time_to_retry = Opt_request_retry_time;
 }
 
-/* Preserves $errno. */
+/* Free resources allocated by init_input().  $errno is preserved. */
 void done_input(struct input_st *input)
 {
 	free_chunks(input->unused);
@@ -1293,7 +1304,9 @@ void done_input(struct input_st *input)
 	input->unused = input->failed = NULL;
 }
 
-/* On error 0 is returned and $errno is set.  Otherwise 1 is returned. */
+/* Initialize $input with $src, $dst and $output, and allocate the right
+ * number of $input->input chunks.  Either of $src or $dst can be NULL.
+ * On error 0 is returned and $errno is set.  Otherwise 1 is returned. */
 int init_input(struct input_st *input, struct output_st *output,
 	struct endpoint_st *src, struct endpoint_st *dst)
 {
@@ -1341,7 +1354,7 @@ int init_input(struct input_st *input, struct output_st *output,
 	} /* until $nchunks unused chunks are created */
 
 	return 1;
-}
+} /* init_input */
 
 void endpoint_connected(struct iscsi_context *iscsi, int status,
 	void *command_data, void *private_data)
@@ -1456,12 +1469,9 @@ int stat_endpoint(struct endpoint_st *endp, char const *which)
 		1, SCSI_INQUIRY_PAGECODE_BLOCK_LIMITS, sizeof(*inq))))
 	{
 		warn_iscsi("inquiry", endp->iscsi);
-		return 0;
 	} else if (!(inq = scsi_datain_unmarshall(task)))
 	{
 		warn_iscsi("inquiry", endp->iscsi);
-		scsi_free_scsi_task(task);
-		return 0;
 	} else if (inq->max_xfer_len > endp->blocksize
 		&& inq->opt_xfer_len > endp->blocksize)
 	{	/* Ensure $blocksize <= $granuality <= $optimum <= $max. */
@@ -1500,7 +1510,12 @@ int stat_endpoint(struct endpoint_st *endp, char const *which)
 		} else	/* $opt_xfer_len == 0 */
 			endp->optimum = endp->granuality;
 	}
+#else
+	task = NULL;
 #endif  /* SCSI_INQUIRY_PAGECODE_BLOCK_LIMITS */
+
+	if (task)
+		scsi_free_scsi_task(task);
 
 	return 1;
 }
@@ -1531,34 +1546,7 @@ int init_endpoint(struct endpoint_st *endp, char const *which,
 }
 
 #ifdef SEXYCAT
-int is_devnode(char const *fname)
-{
-	struct stat st;
-
-	if (stat(fname, &st) < 0)
-		return 0;
-	return S_ISCHR(st.st_mode) || S_ISBLK(st.st_mode);
-}
-
-int is_devnull(int fd)
-{
-	struct stat st1, st2;
-
-	if (fstat(fd, &st1) < 0)
-		return 0;
-	if (!S_ISCHR(st1.st_mode))
-		return 0;
-
-	if (stat("/dev/null", &st2) == 0 && S_ISCHR(st2.st_mode)
-			&& st1.st_rdev == st2.st_rdev)
-		return 1;
-	if (stat("/dev/zero", &st2) == 0 && S_ISCHR(st2.st_mode)
-			&& st1.st_rdev == st2.st_rdev)
-		return 1;
-
-	return 0;
-}
-
+/* Upload a local file to a remote iSCSI target. */
 int local_to_remote(struct input_st *input)
 {
 	off_t maxwrite;
@@ -1578,6 +1566,7 @@ int local_to_remote(struct input_st *input)
 		return 0;
 	}
 
+	/* Loop until all of $src is written out. */
 	eof = overflow = 0;
 	pfd[1].fd = iscsi_get_fd(dst->iscsi);
 	maxwrite = (off_t)dst->blocksize * dst->nblocks;
@@ -1585,11 +1574,14 @@ int local_to_remote(struct input_st *input)
 	{
 		int ret;
 
+		/* Recreate failed iSCSI write requests,
+		 * but don't send them to $dst just yet. */
 		if (!restart_requests(input, NULL, chunk_written))
 			return 0;
 		if (eof && !input->output->nreqs && !input->failed)
 			break;
 
+		/* Wait until I/O is possible without blocking. */
 		pfd[0].events = !eof && input->unused ? POLLIN : 0;
 		pfd[1].events = iscsi_which_events(dst->iscsi);
 		if ((ret = xfpoll(pfd, MEMBS_OF(pfd), input)) < 0)
@@ -1599,11 +1591,13 @@ int local_to_remote(struct input_st *input)
 		} else if (!ret)
 			continue;
 
+		/* Read $src if we can and create an iSCSI write request. */
 		if (pfd[0].revents & POLLIN)
 		{	/* We must have been waiting for POLLIN. */
 			size_t n;
 			struct chunk_st *chunk;
 
+			/* read($src) */
 			assert(input->unused != NULL);
 			chunk = input->unused;
 			if (!xread(pfd[0].fd,chunk->rbuf,dst->blocksize,&n))
@@ -1623,15 +1617,22 @@ int local_to_remote(struct input_st *input)
 					n = 0;
 			}
 
+			/* Is it $eof on $src? */
 			if (n > 0)
 			{	/* Remove $chunk from $input->unused. */
 				take_chunk(chunk);
 				chunk->srcblock = input->top_block++;
 
+				/* We needn't check whether $dst->maxreqs is
+				 * exceeded, because this case we would have
+				 * been out of $input->unused chunks. */
+				assert(input->output->nreqs
+					< input->dst->maxreqs);
 				assert(n >= dst->blocksize);
 				assert(n <= maxwrite);
 				maxwrite -= n;
 
+				/* Create the iSCSI write request. */
 				if (!iscsi_write10_task(
 					dst->iscsi, dst->url->lun,
 					chunk->rbuf, dst->blocksize,
@@ -1644,19 +1645,22 @@ int local_to_remote(struct input_st *input)
 					input->output->nreqs++;
 			} else /* We didn't read anything. */
 				eof = 1;
-		}
+		} /* read from $src */
 
+		/* Is EOF on $src reached? */
 		if (pfd[0].revents & (POLLHUP|POLLRDHUP))
 			eof = 1;
 
+		/* If the connection with $dst works, (re-)send it
+		 * the iSCSI write requests. */
 		if (!is_connection_error(dst->iscsi, "destination",
 			pfd[1].revents))
-		{
+		{	/* If it fails, so does the entire operation. */
 			if (!run_iscsi_event_loop(dst->iscsi, pfd[1].revents))
 				return 0;
 			free_surplus_unused_chunks(input);
 		} else
-		{
+		{	/* Connection problem, reconnect. */
 			if (!reconnect_endpoint(dst))
 				return 0;
 			reduce_maxreqs(dst, "destination");
@@ -1665,7 +1669,7 @@ int local_to_remote(struct input_st *input)
 	} /* until $eof is reached and everything is written out */
 
 	/* Close the input file if we opened it. */
-	if (!src->fname)
+	if (src->fname)
 		close(pfd[0].fd);
 
 	if (overflow)
@@ -1675,56 +1679,80 @@ int local_to_remote(struct input_st *input)
 		return 0;
 	} else
 		return 1;
-}
+} /* local_to_remote */
 
+/* Download from a remote iSCSI target to a local file. */
 int remote_to_local(struct input_st *input, unsigned output_flags)
 {
+	struct stat sbuf;
 	struct pollfd pfd[2];
 	struct endpoint_st *src = input->src;
 	struct endpoint_st *dst = input->dst;
 
-	/* Open the output file. */
+	/* Open the output file.  Fail if the file already exists
+	 * and we weren't invoked with -O.  Exceptions are device
+	 * nodes, which won't be considered overwritten. */
+	memset(&sbuf, 0, sizeof(sbuf));
 	output_flags |= O_CREAT | O_WRONLY;
 	if (!dst->fname || !strcmp(dst->fname, "-"))
 	{	/* Output is stdout. */
 		dst->fname = NULL;
 		pfd[1].fd = STDOUT_FILENO;
-	} else if ((pfd[1].fd = open(dst->fname, output_flags, 0666)) < 0
-		&& (errno != EEXIST || !is_devnode(dst->fname)
-			|| (pfd[1].fd = open(dst->fname,
-				output_flags & ~(O_CREAT|O_EXCL), 0666)) < 0))
-	{
-		warn_errno(dst->fname);
-		return 0;
-	}
+	} else if ((pfd[1].fd = open(dst->fname, output_flags, 0666)) < 0)
+	{	/* Couldn't create/open $dst with $output_flags.  Open it
+		 * without O_CREAT|O_EXCL if it exists and check whether
+		 * it's a device node. */
+		if (errno != EEXIST
+			|| ((pfd[1].fd = open(dst->fname,
+				output_flags & ~(O_CREAT|O_EXCL), 0666)) < 0)
+		    	|| fstat(pfd[1].fd, &sbuf) < 0
+			|| !(S_ISCHR(sbuf.st_mode) || S_ISBLK(sbuf.st_mode)))
+		{
+			warn_errno(dst->fname);
+			close(pfd[1].fd);
+			return 0;
+		}
+	} /* open $dst->fname */
 
-	/* If the output is $seekable we'll possibly use pwrite().
-	 * In this case we need to allocate space for it, otherwise
-	 * it will return ESPIPE. */
+	/* Determine whether $dst->seekable.  If it is we'll possibly
+	 * use pwrite(). */
 	dst->seekable = lseek(pfd[1].fd, 0, SEEK_CUR) != (off_t)-1;
-	if (dst->seekable
-		&& ftruncate(pfd[1].fd,
-			(off_t)src->blocksize * src->nblocks) < 0
-		&& (errno != EINVAL || !is_devnull(pfd[1].fd)))
-	{
-		warn_errno(dst->fname);
-		return 0;
-	}
+	if (dst->seekable)
+	{	/* For this to work we need to allocate space in advance,
+		 * pwrite() will return ESPIPE.  The exceptions are device
+		 * nodes are exceptions, because they can't be truncated. */
+		if (!sbuf.st_mode)
+			/* Haven't fstat()ed $dst. */
+			fstat(pfd[1].fd, &sbuf);
+		if (!(S_ISCHR(sbuf.st_mode) || S_ISBLK(sbuf.st_mode))
+			&& ftruncate(pfd[1].fd,
+				(off_t)src->blocksize * src->nblocks) < 0)
+		{	/* Either fstat() failed or it's not a device node
+			 * and it can't be ftruncate()d. */
+			warn_errno(dst->fname);
+			return 0;
+		}
+	} /* $dst->seekable */
 
+	/* Loop until $input->until is reached. */
 	pfd[0].fd = iscsi_get_fd(src->iscsi);
 	for (;;)
 	{
 		int eof, ret;
 
+		/* (Re)create the iSCSI read requests,
+		 * but don't send them to $src just yet. */
 		if (!restart_requests(input, chunk_read, NULL))
 			return 0;
 		if (!start_iscsi_read_requests(input, chunk_read))
 			return 0;
 
+		/* Anything more to do? */
 		eof = !input->nreqs && !input->failed;
 		if (eof && !input->output->enqueued)
 			break;
 
+		/* Wait until I/O is possible without blocking. */
 		pfd[0].events = iscsi_which_events(src->iscsi);
 		pfd[1].events = process_output_queue(-1, dst, input->output,
 					!eof)
@@ -1736,13 +1764,15 @@ int remote_to_local(struct input_st *input, unsigned output_flags)
 		} else if (!ret)
 			continue;
 
+		/* If the connection with $src works, (re-)send it
+		 * the iSCSI read requests. */
 		if (!is_connection_error(src->iscsi, "source",
 			pfd[0].revents))
 		{
 			if (!run_iscsi_event_loop(src->iscsi, pfd[0].revents))
 				return 0;
 		} else
-		{
+		{	/* Connection problem, reconnect. */
 			if (!reconnect_endpoint(src))
 				return 0;
 			reduce_maxreqs(src, "source");
@@ -1750,35 +1780,39 @@ int remote_to_local(struct input_st *input, unsigned output_flags)
 		}
 
 		if (pfd[1].revents)
-		{
+		{	/* Dump $input->output to the local file. */
 			process_output_queue(pfd[1].fd, dst, input->output,
 				!eof);
 			free_surplus_unused_chunks(input);
 		}
-	}
+	} /* until $eof is reached and everything is written out */
 
 	assert(input->top_block == input->until);
 	assert(input->nread == (off_t)src->blocksize * src->nblocks);
 
 	/* Close the input file if we opened it. */
-	if (!dst->fname)
-		close(pfd[0].fd);
+	if (dst->fname)
+		close(pfd[1].fd);
 
 	return 1;
-}
+} /* remote_to_local */
 
+/* Copy between remote iSCSI targets. */
 int remote_to_remote(struct input_st *input)
 {
 	struct pollfd pfd[2];
 	struct endpoint_st *src = input->src;
 	struct endpoint_st *dst = input->dst;
 
+	/* Loop until $src->until is reached and everything is written out
+	 * to $dst. */
 	pfd[0].fd = iscsi_get_fd(src->iscsi);
 	pfd[1].fd = iscsi_get_fd(dst->iscsi);
 	for (;;)
 	{
 		int ret;
 
+		/* (Re)create iSCSI requests. */
 		if (!restart_requests(input, chunk_read, chunk_written))
 			return 0;
 		if (!start_iscsi_read_requests(input, chunk_read))
@@ -1786,6 +1820,7 @@ int remote_to_remote(struct input_st *input)
 		if (!input->nreqs && !input->output->nreqs && !input->failed)
 			break;
 
+		/* Wait until I/O is possible without blocking. */
 		pfd[0].events = iscsi_which_events(src->iscsi);
 		pfd[1].events = iscsi_which_events(dst->iscsi);
 		if ((ret = xfpoll(pfd, MEMBS_OF(pfd), input)) < 0)
@@ -1795,6 +1830,7 @@ int remote_to_remote(struct input_st *input)
 		} else if (!ret)
 			continue;
 
+		/* Send $src the read requests. */
 		if (!is_connection_error(src->iscsi, "source",
 			pfd[0].revents))
 		{
@@ -1808,6 +1844,7 @@ int remote_to_remote(struct input_st *input)
 			free_surplus_unused_chunks(input);
 		}
 
+		/* Send $dst the write requests. */
 		if (!is_connection_error(dst->iscsi, "destination",
 			pfd[1].revents))
 		{
@@ -1821,12 +1858,12 @@ int remote_to_remote(struct input_st *input)
 			reduce_maxreqs(dst, "destination");
 			free_surplus_unused_chunks(input);
 		}
-	}
+	} /* until $src->until is reached and everything is written out */
 
 	assert(input->top_block == input->until);
 	assert(input->nread == (off_t)src->blocksize * src->nblocks);
 	return 1;
-}
+} /* remote_to_remote */
 
 /* The main function */
 int main(int argc, char *argv[])
@@ -2134,7 +2171,7 @@ int main(int argc, char *argv[])
 	destroy_endpoint(&dst.endp);
 
 	exit(!isok);
-}
+} /* main */
 #endif /* SEXYCAT */
 
 /* vim: set foldmarker={{{,}}} foldmethod=marker: */
