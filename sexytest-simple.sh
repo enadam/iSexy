@@ -29,7 +29,7 @@ then
 fi
 
 blocksize=`./sexywrap -N -s "$url" \
-	| sed -ne 's/source target: blocksize=\([0-9]\+\).*/\1/p'`;
+	| sed -ne 's/source target: nblocks=\([0-9]\+\), blocksize=\([0-9]\+\).*/\2/p'`;
 seq="512 1 2 3 5 12 123 511 513 1000 1023 1024 1025 1234";
 [ $blocksize -lt 2048 ] \
 	|| seq="$seq 2000 2047 2048 2049 2345";
@@ -55,10 +55,11 @@ fi
 
 if [ $# -eq 0 -o "x$1" = "x-w" ];
 then
+	size=`stat --printf '%s' "$disk"`;
 	input1=`mktemp sexytest-write-XXXXXX`;
-	dd if=/dev/urandom of="$input1" bs=4k count=1024 2> /dev/null;
+	head -c $size /dev/urandom > "$input1";
 	input2=`mktemp sexytest-write-XXXXXX`;
-	dd if=/dev/urandom of="$input2" bs=4k count=1024 2> /dev/null;
+	head -c $size /dev/urandom > "$input2";
 	input="$input1";
 	for n in $seq;
 	do

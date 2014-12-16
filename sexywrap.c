@@ -390,7 +390,7 @@ int read_blocks(struct input_st *input, callback_t read_cb)
 		{	/* Connection problem with $src, reconnect. */
 			if (!reconnect_endpoint(src))
 				goto eio;
-			reduce_maxreqs(src, NULL);
+			reduce_maxreqs(NULL, src);
 			free_surplus_unused_chunks(input);
 		}
 	} /* until $input->until is reached */
@@ -435,8 +435,12 @@ int write_blocks(struct input_st *input, scsi_block_addr_t from,
 	{
 		int ret;
 
-		/* Called when a chunk is/not written and add it to
-		 * the failed list or returns it to the unused list. */
+		/*
+		 * Called when a chunk is/not written and add it to
+		 * the failed list or returns it to the unused list.
+		 * This callback is required by restart_requests()
+		 * to know what's completed and what's failed.
+		 */
 		void write_cb(struct iscsi_context *iscsi, int status,
 			void *command_data, void *private_data)
 		{
@@ -477,16 +481,17 @@ int write_blocks(struct input_st *input, scsi_block_addr_t from,
 			take_chunk(chunk);
 
 			assert(sbuf >= dst->blocksize);
-			if (!iscsi_write10_task(
-					dst->iscsi, dst->url->lun,
-					(void *)buf, dst->blocksize,
-					from++, 0, 0, dst->blocksize,
+			chunk->sbuf = dst->blocksize;
+			chunk->u.wbuf = buf;
+			if (!write_endpoint(dst, from,
+					chunk->u.wbuf, chunk->sbuf,
 					write_cb, chunk))
 				goto enomem;
-
 			input->output->nreqs++;
-			buf  += dst->blocksize;
-			sbuf -= dst->blocksize;
+
+			buf  += chunk->sbuf;
+			sbuf -= chunk->sbuf;
+			from += chunk->sbuf / dst->blocksize;
 		} /* request write */
 
 		/* Wait until output is possible without blocking. */
@@ -505,7 +510,7 @@ int write_blocks(struct input_st *input, scsi_block_addr_t from,
 		{
 			if (!reconnect_endpoint(dst))
 				return 0;
-			reduce_maxreqs(dst, NULL);
+			reduce_maxreqs(NULL, dst);
 			free_surplus_unused_chunks(input);
 		}
 	} /* until !$sbuf */
@@ -618,7 +623,7 @@ int open(char const *fname, int flags, ...)
 
 	/* Connect to the target iSCSI. */
 	if (!connect_endpoint(iscsi, url)
-		|| !stat_endpoint(&target->endp, NULL))
+		|| !stat_endpoint("iSCSI", &target->endp, 0))
 	{	/* Return some generic error.  The called functions have
 		 * already logged the real reason. */
 		cleanup_target(target);
@@ -626,6 +631,7 @@ int open(char const *fname, int flags, ...)
 		return -1;
 	} else
 	{	/* Finishing touches. */
+		calibrate_endpoint(&target->endp, 0);
 		target->endp.maxreqs = DFLT_INITIAL_MAX_ISCSI_REQS;
 		target->mode = flags & (O_RDONLY | O_WRONLY | O_RDWR);
 	}
@@ -848,6 +854,7 @@ off_t lseek64(int fd, off_t offset, int whence)
 ssize_t read(int fd, void *buf, size_t sbuf)
 {
 	int fatal;
+	off_t nread;
 	struct input_st input;
 	struct output_st output;
 	scsi_block_addr_t first;
@@ -889,9 +896,9 @@ ssize_t read(int fd, void *buf, size_t sbuf)
 
 		assert(task != NULL);
 		assert(chunk != NULL);
-		assert(LBA_OF(task) == chunk->srcblock);
-		assert(chunk->srcblock >= first);
-		assert(chunk->srcblock < input.until);
+		assert(LBA_OF(task) == chunk->address);
+		assert(chunk->address >= first);
+		assert(chunk->address < input.until);
 
 		assert(chunk->input->nreqs > 0);
 		chunk->input->nreqs--;
@@ -904,16 +911,16 @@ ssize_t read(int fd, void *buf, size_t sbuf)
 			scsi_free_scsi_task(task);
 			chunk_failed(chunk);
 			return;
-		} else if (chunk->srcblock > first)
-		{	/* $first < $chunk->srcblock < $first + $nblocks */
+		} else if (chunk->address > first)
+		{	/* $first < $chunk->address < $first + $nblocks */
 			/* This chunk possibly includes the last block. */
 			/* $offset := where to copy in @buf */
 			offset  = target->endp.blocksize - offset;
-			offset += (chunk->srcblock - first - 1)
+			offset += (chunk->address - first - 1)
 				* target->endp.blocksize;
 
 			/*
-			 *  first     first+1 (=: srcblock)
+			 *  first     first+1 (=: address)
 			 * /     blocksize   \/task->datain.data\
 			 * |--------v---------|======v===========|
 			 * |        |offset1/2|  n   |      first+2
@@ -928,11 +935,11 @@ ssize_t read(int fd, void *buf, size_t sbuf)
 				? task->datain.size
 				: sbuf - offset;
 			memcpy(buf+offset, task->datain.data, n);
-			input.nread += n;
+			nread += n;
 		} else if (task->datain.size > offset)
 		{	/* First block, we may not need the first $offset
 			 * bytes of the returned data. */
-			assert(chunk->srcblock == first);
+			assert(chunk->address == first);
 
 			/* $n := the number of bytes to copy */
 			assert(offset < task->datain.size);
@@ -940,7 +947,7 @@ ssize_t read(int fd, void *buf, size_t sbuf)
 				? task->datain.size - offset
 				: sbuf;
 			memcpy(buf, &task->datain.data[offset], n);
-			input.nread += n;
+			nread += n;
 		} else	/* Less than blocksize data returned.  This is
 			 * a serious error and indicates broken server,
 			 * so let's consider this a $fatal error. */
@@ -950,10 +957,11 @@ ssize_t read(int fd, void *buf, size_t sbuf)
 		return_chunk(chunk);
 	} /* read_cb */
 
+	nread = 0;
 	if (!read_blocks(&input, read_cb))
 	{	/* Failure, $errno is set. */;
 		sbuf = 0;
-	} else if (fatal || input.nread < sbuf)
+	} else if (fatal || nread < sbuf)
 	{	/* We've read less than expected, but we have no means
 		 * knowing which blocks have been read, so let's report
 		 * total failure. */
@@ -1017,9 +1025,9 @@ ssize_t write(int fd, void const *buf, size_t sbuf)
 
 		assert(task != NULL);
 		assert(chunk != NULL);
-		assert(LBA_OF(task) == chunk->srcblock);
-		assert(chunk->srcblock >= from);
-		assert(chunk->srcblock < input.until);
+		assert(LBA_OF(task) == chunk->address);
+		assert(chunk->address >= from);
+		assert(chunk->address < input.until);
 
 		assert(chunk->input->nreqs > 0);
 		chunk->input->nreqs--;
@@ -1033,17 +1041,17 @@ ssize_t write(int fd, void const *buf, size_t sbuf)
 
 		/* Determine which block has been read.  When checking
 		 * the LBAs take care not to commit integer overflow. */
-		if (chunk->srcblock == from)
+		if (chunk->address == from)
 		{
 			assert(!first);
 			first = task;
-		} else if (chunk->srcblock - from == 1)
+		} else if (chunk->address - from == 1)
 		{
 			assert(!second);
 			second = task;
 		} else
 		{
-			assert(input.until - chunk->srcblock == 1);
+			assert(input.until - chunk->address == 1);
 			assert(!last);
 			last = task;
 		}

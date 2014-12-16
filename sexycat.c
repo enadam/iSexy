@@ -45,40 +45,38 @@
  *				default is used as for <src-initiator-name>.
  *				Ignored if the destination is a local file.
  *   -N				Don't do any I/O, just connect to the iSCSI
- *				device(s) and log in.
+ *				device(s) and log in and print the capacity
+ *				of the iSCSI target(s).
  *   -O				Overwrite the local destination <file-name>.
  *   -v				Be more verbose:
- *				-- at level 1 the capacity of the iSCSI disks
- *				   are printed at the beginning; this is the
- *				   default and it's useful to see that the
- *				   connection(s) to the remote iSCSI disk(s)
- *				   works
  *				-- at level 2 it's printed when a block is
  *				   being re-read or rewritten due to a fault
- *				-- at subsequent levels reading of source
- *				   blocks are printed if progress reporting
- *				   is enabled with -p
+ *				The default level is 1.
  *   -q				Be less verbose.  At verbosity level 0 all
  *				informational output is suppressed.
- *   -p <input-progress>	Print input progress every so often.
- *				The first printout is made when the
- *				<input-progress>:nth block is being
- *				or has been read.  For example -p 123
- *				makes the reading of block #123 logged.
- *				Ignored when a local file is being uploaded.
- *   -P <output-progress>	Likewise for output progress.  The first
- *				printout signifies the writing of the
- *				<output-progress>:nth source block.
- *				Ignored if the destination is a local file.
- *   -m <max-source-reqs>	The maximum number of parallel requests
- *				to the source iSCSI device.  If connection
- *				breaks, this number is reduced by the factor
- *				which can be specified with -R.  Ignored
- *				when the source is a local file, otherwise
- *				the default is 32.
- *   -M <max-dest-reqs>		Same for the maximum number of iSCSI write
- *				requests.  Ignored when the destination is
- *				a local file, otherwise the default is 32.
+ *   -p {<secs>|<millissecs>ms}	Report progress (block number being read,
+ *				last block that has been read and written)
+ *				every so often.  If no progress was made
+ *				since the last time it had been reported,
+ *				it's suppressed, unles 10 * <seconds> have
+ *				passed.
+ *   -fF <fallback-blocksize>	If the iSCSI target's block size cannot be
+ *				determined, suppose the given value instead
+ *				of the default 512 bytes.  -F only sets the
+ *				destination target's, -f sets it for both.
+ *				If you only want to set it for the source,
+ *				specify -F 0 explicitly after -f.
+ *   -cC <chunk-size>		Read/write <chunk-size> blocks of data at once
+ *				if possible.  If not specified the server is
+ *				queried for its preference.  -c and -C are in
+ *				the same relation as -f and -F.
+ *   -mM <max-reqs>		The maximum number of parallel requests
+ *				to iSCSI targets.  If the connection breaks,
+ *				this number is reduced by the factor which
+ *				can be specified with -R.  Ignored when
+ *				the endpoint is a local file, otherwise
+ *				the default is 32.  -m and -M are in the
+ *				same relation as -f and -F.
  *   -b <min-output-batch>	Collect at least this number of input chunks
  *				before writing them out.  Writing of larger
  *				batches can be more efficient.  Only effective
@@ -115,8 +113,9 @@
  * (This could be improved in the future.)  Requests are sent parallel,
  * with a backoff strategy if the server feels overloaded.
  *
- * TODO query and make use of the server's optimal chunk size
- * TODO allow specification of offset and nblocks
+ * TODO cmdline: input start block, number of blocks
+ * TODO cmdline: output offset
+ * TODO use readcapacity16 et al.
  * TODO full documentation
  *
  * Dependecies: libiscsi 1.4
@@ -268,9 +267,8 @@ struct endpoint_st
 	 * of local input/output. */
 	unsigned maxreqs;
 
-	/* The destination's block size if it's an iSCSI device, otherwise
-	 * the source device's block size.  In the latter case this tells
-	 * the amoount of data in a chunk. */
+	/* The destination's block size if it's an iSCSI device,
+	 * otherwise the source device's block size. */
 	unsigned blocksize;
 
 	union
@@ -281,21 +279,39 @@ struct endpoint_st
 			/* The number of blocks of the target. */
 			scsi_block_count_t nblocks;
 
-			/* In future these may be used to choose
-			 * the optimal transfer amount. */
-			//unsigned granuality, optimum;
+			/*
+			 * $optimum is the number of blocks the target
+			 * likes to transfer in a request.  Whenever
+			 * possible we try to size our chunks to carry
+			 * that many blocks of information.
+			 *
+			 * $granuality is also a preference of the target.
+			 * If we need to transfer less than $optimum blocks,
+			 * we try to request <integer>*$granuality number
+			 * of them.  If we need even less, we just request
+			 * the exact number.
+			 *
+			 * $maximum is the maximum number of blocks that
+			 * can be requested at once.  It can be zero if
+			 * it wasn't specified; this case there's no upper
+			 * limit.  This value is not used during operation.
+			 */
+			scsi_block_count_t optimum, maximum, granuality;
 		};
 
-		/* Used for local destination.  If a file is $seekable,
-		 * we'll use pwrite[v]() to write blocks out-of-order.
-		 * Otherwise they're written sequentially with write[v](). */
+		/*
+		 * This field is used for local destination.  If a file
+		 * is $seekable, we'll use pwrite[v]() to write blocks
+		 * out-of-order.  Otherwise they're written sequentially
+		 * with write[v]().
+		 */
 		int seekable;
 	};
 };
 
 /* Represents a unit of data being read or written in a single request.
- * Currently the chunk size is the same as the source or destination
- * device's block size, but this may change in the future. */
+ * The chunk size can vary, but it's never less than the block size of
+ * the target or larger than the target's optimal transfer size. */
 struct input_st;
 struct chunk_st
 {
@@ -306,23 +322,41 @@ struct chunk_st
 	/* All chunks link to the same input_st. */
 	struct input_st *input;
 
-	/* Index of the source block being read or written by this chunk
-	 * or zero if the chunk is unused. */
-	scsi_block_addr_t srcblock;
+	/* Starting address of the block(s) being read or written
+	 * in this chunk. */
+	scsi_block_addr_t address;
 
 	/* If the chunk is failed, the number of milliseconds until retry.
 	 * This is recalculated by restart_requests().  Zero for unused
 	 * chunks. */
 	unsigned time_to_retry;
 
-	/* The data carried by this chunk.  When the source is local,
-	 * the input buffer is allocated together with the chunk_st.
-	 * $wbuf is used by sexywrap. */
+	/* The data carried by this chunk. */
 	union
 	{
-		void *wbuf;
+		/* Created by libiscsi and used by remote_to_local()
+		 * and remote_to_remote(). */
 		struct scsi_task *read_task;
-		unsigned char rbuf[0];
+
+		struct
+		{
+			/* The size of buffer referred by $rbuf or $wbuf.
+			 * For $read_task, this information is contained
+			 * therein. */
+			size_t sbuf;
+
+			union
+			{
+				/* Used by sexywrap and points to
+				 * a separately allocated buffer. */
+				void const *wbuf;
+
+				/* Used by local_to_remote() and designates
+				 * the beginning of the buffer allocated
+				 * together with the containing chunk_st. */
+				unsigned char rbuf[0];
+			} u;
+		};
 	};
 };
 
@@ -357,14 +391,6 @@ struct output_st
 			 * copied to $iov, a preallocated iovec array. */
 			struct iovec *iov;
 			struct scsi_task **tasks;
-
-			/*
-			 * Index of the first unwritten source block.
-			 * For example if blocks 0..32 and 64..128 have
-			 * been written this field if 33.  It helps
-			 * determining when the operation is complete.
-			 */
-			scsi_block_addr_t top_block;
 		};
 	};
 };
@@ -376,14 +402,13 @@ struct input_st
 	 * local file. */
 	unsigned nreqs;
 
-	/* $top_block is the index of the first unread source block,
-	 * and keep reading $until is reached.  Both are zero if the
-	 * input is a local file. */
+	/*
+	 * In REMOTE_TO_*() modes $top_block is the address of the lowest
+	 * unread source block; in LOCAL_TO_REMOTE() mode it's the address
+	 * of the highest block being or having been written.  Reading or
+	 * writing continues $until is reached.  
+	 */
 	scsi_block_addr_t top_block, until;
-
-	/* The number of bytes that has been read.  Only used to verify
-	 * that the expected amount has been read by remote_to_*(). */
-	off_t nread;
 
 	/*
 	 * $unused is a list of preallocated chunks ready for reading.
@@ -417,6 +442,11 @@ static void __attribute__((nonnull(2)))
 static void __attribute__((noreturn, format(printf, 1, 2)))
 	die(char const *fmt, ...);
 
+static unsigned timediff(
+	struct timespec const *later,
+	struct timespec const *earlier);
+static void report_progress(void);
+
 static void *__attribute__((malloc)) xmalloc(size_t size);
 static void xrealloc(void *ptrp, size_t size);
 static int xpoll(struct pollfd *pfd, unsigned npolls);
@@ -445,6 +475,9 @@ static void chunk_written(struct iscsi_context *iscsi, int status,
 	void *command_data, void *private_data);
 static void chunk_read(struct iscsi_context *iscsi, int status,
 	void *command_data, void *private_data);
+static size_t read_chunk_size(
+	struct endpoint_st const *src, struct endpoint_st const *dst,
+	scsi_block_addr_t from, scsi_block_addr_t until);
 static int restart_requests(struct input_st *input,
 	callback_t read_cb, callback_t write_cb);
 static int start_iscsi_read_requests(struct input_st *input,
@@ -452,7 +485,7 @@ static int start_iscsi_read_requests(struct input_st *input,
 
 static void free_chunks(struct chunk_st *chunk);
 static void free_surplus_unused_chunks(struct input_st *input);
-static void reduce_maxreqs(struct endpoint_st *endp, char const *which);
+static void reduce_maxreqs(char const *which, struct endpoint_st *endp);
 static void return_chunk(struct chunk_st *chunk);
 static void take_chunk(struct chunk_st *chunk);
 static void chunk_failed(struct chunk_st *chunk);
@@ -467,23 +500,33 @@ static int connect_endpoint(struct iscsi_context *iscsi,
 	struct iscsi_url *url);
 static int reconnect_endpoint(struct endpoint_st *endp);
 
+static struct scsi_task *read_endpoint(struct endpoint_st const *endp,
+	scsi_block_addr_t block, size_t chunk_size,
+	callback_t read_cb, struct chunk_st *chunk);
+static struct scsi_task *write_endpoint(struct endpoint_st const *endp,
+	scsi_block_addr_t block, void const *buf, size_t sbuf,
+	callback_t write_cb, struct chunk_st *chunk);
+
 static void destroy_endpoint(struct endpoint_st *endp);
-static int stat_endpoint(struct endpoint_st *endp, char const *which);
-static int init_endpoint(struct endpoint_st *endp, char const *which,
-	char const *url);
+static void print_endpoint(char const *which, struct endpoint_st const *endp);
+static void calibrate_endpoint(struct endpoint_st *endp,
+	scsi_block_count_t desired_optimum);
+static int stat_endpoint(char const *which, struct endpoint_st *endp,
+	unsigned fallback_blocksize);
+static int init_endpoint(char const *which,
+	struct endpoint_st *endp, char const *url,
+	unsigned fallback_blocksize);
 
 static int local_to_remote(struct input_st *input);
 static int remote_to_local(struct input_st *input, unsigned output_flags);
 static int remote_to_remote(struct input_st *input);
 /* }}} */
 
-/* Private variables */
+/* Private variables {{{ */
 /* User controls {{{ */
-/* -vq */
-static int Opt_verbosity;
-
-/* -pP */
-static unsigned Opt_read_progress, Opt_write_progress;
+/* -vqp */
+/* By default $Opt_verbosity is 1.  $Opt_progress is in milliseconds. */
+static int Opt_verbosity, Opt_progress;
 
 /* -bB */
 static unsigned Opt_min_output_batch = DFLT_MIN_OUTPUT_BATCH;
@@ -503,11 +546,37 @@ static unsigned Opt_maxreqs_degradation = DFLT_ISCSI_MAXREQS_DEGRADATION;
 static FILE *Info;
 static char const *Basename = "sexywrap";
 
+/*
+ * -- $Start: when the program was started; used by report_progress()
+ *    to show the timestamp
+ * -- $Last_report: the last time report_progress() printed something
+ * -- $Now: the current time after the invocation of xfpoll()
+ *
+ * All of these times are from clock_gettime().  $Last_report and $Now
+ * are used by report_progress() to decide whether it's time to wake up.
+ * $Now is also used by xfpoll() to maintain the retry timers of chunks.
+ */
+static struct timespec Start, Last_report, Now;
+
+/*
+ * The latest blocks being/having been read/written.  $Last values are
+ * updated by start_iscsi_read_requests() ($reading), chunk_read() ($red),
+ * and chunk_written() ($written).  $Prev:ious reported values are saved
+ * in order report_progress() not to repeat itself too often.
+ */
+static struct
+{
+	scsi_block_addr_t reading, red;
+	scsi_block_addr_t writing, written;
+} Prev, Last;
+/* }}} */
+
 /* Program code */
 void usage(void)
 {
-	printf("usage: %s [-vq] "
-		"[-pP <progress>] "
+	printf("usage: %s [-vq] [-p <progress>] "
+		"[-fF <fallback-blocksize>] "
+		"[-cC <chunk-size>] "
 		"[-mM <max-requests> "
 		"[-r <retry-pause>] [-R <request-degradation>] "
 		"[-bB <batch-size>] "
@@ -582,6 +651,73 @@ void die(char const *fmt, ...)
 	exit(1);
 }
 
+/* Return $later - $earlier in ms.  It is assumed that $later >= $earlier. */
+unsigned timediff(struct timespec const *later,
+	struct timespec const *earlier)
+{
+	const unsigned ms_per_sec = 1000;
+	const long ns_per_ms = 1000000;
+	unsigned diff;
+
+	/* Verify the precondition. */
+	if (later->tv_sec != earlier->tv_sec)
+		assert(later->tv_sec > earlier->tv_sec);
+	else 
+		assert(later->tv_nsec >= earlier->tv_nsec);
+
+	diff  = (later->tv_sec  - earlier->tv_sec)  * ms_per_sec;
+	diff += (later->tv_nsec - earlier->tv_nsec) / ns_per_ms;
+
+	return diff;
+} /* timediff */
+
+/* Print $Last if $Opt_progress has passed since the previous report.
+ * Called by xpoll() and xfpoll(). */
+void report_progress(void)
+{
+#ifdef SEXYCAT
+	unsigned diff, hours, mins, secs;
+
+	if (!Opt_progress)
+		return;
+	if (!Start.tv_sec && !Start.tv_nsec)
+		return;
+
+	assert(Now.tv_sec || Now.tv_nsec);
+	diff = timediff(&Now, Last_report.tv_sec || Last_report.tv_nsec
+		? &Last_report : &Start);
+	if (diff < Opt_progress)
+		/* $Opt_progress hasn't passed since $Last_report. */
+		return;
+	if (diff < 10 * Opt_progress
+			&& Last.reading == Prev.reading
+			&& Last.red == Prev.red
+			&& Last.written == Prev.written)
+		/* $Opt_progress has passed, but the values didn't change,
+		 * don't report unless 10*$Opt_progress has passed. */
+		return;
+
+	/* $diff := $Now - $Start.  Don't recalculate it if we used
+	 * $Start earlier. */
+	if (Last_report.tv_sec || Last_report.tv_nsec)
+		diff = timediff(&Now, &Start);
+
+	/* $diff -> $hours:$mins:$secs */
+	diff /= 1000;
+	hours = diff / (60*60);
+	diff %= 60*60;
+	mins = diff / 60;
+	secs = diff % 60;
+
+	info("[%.2u:%.2u:%.2u] "
+	     	"reading #%u, have read #%u, writing #%u, written #%u",
+		hours, mins, secs,
+		Last.reading, Last.red, Last.writing, Last.written);
+	Prev = Last;
+	Last_report = Now;
+#endif /* SEXYCAT */
+} /* report_progress */
+
 void *xmalloc(size_t size)
 {
 	void *ptr;
@@ -608,18 +744,23 @@ int xpoll(struct pollfd *pfd, unsigned npolls)
 	int ret;
 
 	for (;;)
-	{
-		if ((ret = poll(pfd, npolls, -1)) > 0)
+	{	/* Sleep at most $Opt_progress if progress reporting
+		 * is enabled. */
+		if (Opt_progress)
+		{
+			ret = poll(pfd, npolls, Opt_progress);
+			clock_gettime(CLOCK_MONOTONIC, &Now);
+			report_progress();
+		} else	/* We can sleep indefinitely long. */
+			ret = poll(pfd, npolls, -1);
+		if (ret > 0)
 			return ret;
-		if (ret < 0 && errno == EINTR)
-			continue;
-		if (!ret) /* ??? */
-			errno = ENODATA;
-		return 0;
-	}
+		if (ret < 0 && errno != EINTR)
+			return 0;
+	} /* while EINTR */
 }
 
-/* On failure $errno is set. */
+/* As a side-effect $Now is updated.  On failure $errno is set. */
 int xfpoll(struct pollfd *pfd, unsigned npolls, struct input_st *input)
 {
 	int ret, eintr;
@@ -632,27 +773,32 @@ int xfpoll(struct pollfd *pfd, unsigned npolls, struct input_st *input)
 	/* poll() as long as it returns EINTR. */
 	do
 	{
-		unsigned timeout, diff;
-		struct timespec from, now;
+		struct timespec since;
 		struct chunk_st *chunk;
-		const unsigned ms_per_sec = 1000;
-		const unsigned long ns_per_ms = 1000000;
+		unsigned timeout, elapsed;
 
-		/* Measure the time between the entry and exit from poll() */
+		/*
+		 * Measure the time since we were called last time.
+		 * Sleep at most $timeout milliseconds, which is either
+		 * the expiration of the oldest failed chunk, or the
+		 * time to the next progress report.
+		 */
+		since = Now.tv_sec || Now.tv_nsec ? Now : Start;
 		timeout = input->failed->time_to_retry;
-		clock_gettime(CLOCK_MONOTONIC, &from);
+		if (Opt_progress && timeout > Opt_progress)
+			timeout = Opt_progress;
 		ret = poll(pfd, npolls, timeout);
 		eintr = ret < 0 && errno == EINTR;
-		clock_gettime(CLOCK_MONOTONIC, &now);
 
-		/* $diff := $now - $from */
-		diff  = (now.tv_sec  - from.tv_sec)  * ms_per_sec;
-		diff += (now.tv_nsec - from.tv_nsec) / ns_per_ms;
+		/* Get the $elapsed time $since. */
+		clock_gettime(CLOCK_MONOTONIC, &Now);
+		elapsed = timediff(&Now, &since);
+		report_progress();
 
 		/* Subtract the elapsed time from all failed chunks. */
 		for (chunk = input->failed; chunk; chunk = chunk->next)
-			if (chunk->time_to_retry > diff)
-				chunk->time_to_retry -= diff;
+			if (chunk->time_to_retry > elapsed)
+				chunk->time_to_retry -= elapsed;
 			else
 				chunk->time_to_retry = 0;
 	} while (eintr);
@@ -660,9 +806,15 @@ int xfpoll(struct pollfd *pfd, unsigned npolls, struct input_st *input)
 	return ret;
 }
 
-/* Try to fill $buf with $sbuf bytes from $fd, but no hard promises.
- * On error $errno is set and 0 is returned.  Otherwise 1 is returned
- * and the number of bytes actually read is stored in *$nreadp. */
+/*
+ * Read $fd until $buf is filled with $sbuf bytes.  Only returns less
+ * than that if EOF is reached or an error is ecountered.  This latter
+ * case $errno is propagated and 0 is returned.  Otherwise 1 is returned
+ * and the number of bytes actually read is stored in *$nreadp.
+ *
+ * TODO Since this function can block, processing of iSCSI management
+ *      messages (pings) can be delayed indefinitely.
+ */
 int xread(int fd, unsigned char *buf, size_t sbuf, size_t *nreadp)
 {
 	*nreadp = 0;
@@ -678,7 +830,7 @@ int xread(int fd, unsigned char *buf, size_t sbuf, size_t *nreadp)
 		else if (errno != EAGAIN && errno != EINTR
 				&& errno != EWOULDBLOCK)
 			return 0;
-	}
+	} /* until $buf is filled */
 
 	return 1;
 }
@@ -831,28 +983,29 @@ int process_output_queue(int fd,
 {
 	int need_to_seek;
 	unsigned niov, ntasks;
-	scsi_block_addr_t first, block;
-	struct scsi_task **tasks, **from_task, **t;
+	scsi_block_addr_t block;
+	struct scsi_task **tasks, **from, **t;
 
 	/*
 	 * $niov	:= the number of buffers in the current batch
-	 * $first	:= the first block in the batch; if it's
-	 *		   $output->top_block, then the batch can be flushed
-	 *		   without seeking
 	 * $block	:= the next block we expect in the batch
 	 * $tasks	:= where to take from the next buffer of the batch
 	 * $ntasks	:= how many buffers till the end of $output->tasks
-	 * $from_task	:= the first buffer in the batch
+	 * $from	:= the first buffer in the batch
 	 * $need_to_seek := whether the current position of $fd is $first
 	 */
 	niov = 0;
 	need_to_seek = 0;
-	ntasks = output->enqueued;
-	first = block = output->top_block;
-	tasks = from_task = output->tasks;
+	if (!(ntasks = output->enqueued))
+		return 0;
+	tasks = from = output->tasks;
+	block = LBA_OF(from[0]);
 
-	/* Send all of $output->enqueued batches. */
+	/* Send all of $output->enqueued batches.
+	 * We'd be fine without gotos, they're only used to skip conditions
+	 * known to be false. */
 	assert(output->max > 0);
+	goto middle;
 	for (;;)
 	{
 		if (niov >= output->max)
@@ -865,30 +1018,43 @@ int process_output_queue(int fd,
 				 * $more_to_come. */
 				break;
 			/* Fall through. */
-		} else if (LBA_OF(*tasks) == block)
+		} else if (LBA_OF(tasks[0]) < block)
+		{	/* Repeated/overlapping chunk, should not happen. */
+			assert(0);
+		} else if (LBA_OF(tasks[0]) == block)
 		{	/* Found the next buffer in $output->tasks. */
-			if (fd >= 0)
-				add_to_output_iov(output, *tasks, niov);
+middle:			if (fd >= 0)
+				add_to_output_iov(output, tasks[0], niov);
 			niov++;
+
+			/* Move $block forward by the number of blocks
+			 * carried by $tasks[0]. */
+			assert(tasks[0]->datain.size % dst->blocksize == 0);
+			block += tasks[0]->datain.size / dst->blocksize;
+
 			tasks++;
 			ntasks--;
-			block++;
 			continue;
 		} else if (niov >= Opt_min_output_batch)
 		{	/* The current batch has finished and there's
 			 * enough output to flush.  Fall through. */
 		} else if (dst->seekable)
 		{	/* The current batch is too small to output,
-			 * but we can see the next one, because the
-			 * output is seekable. */
-			/* The next batch starts from *tasks. */
-			first = LBA_OF(*tasks);
-			block = first + 1;
-			from_task = tasks;
-			if (fd >= 0)
-				add_to_output_iov(output, *tasks, 0);
+			 * but we can jump to the next one, because
+			 * the output is $seekable. */
+			/* The next batch starts from &tasks[0]. */
+			from = tasks;
 			tasks++;
 			ntasks--;
+
+			/* $from is the first chunk of the batch,
+			 * move $block forward. */
+			assert(from[0]->datain.size % dst->blocksize == 0);
+			block = LBA_OF(from[0])
+				+ from[0]->datain.size / dst->blocksize;
+
+			if (fd >= 0)
+				add_to_output_iov(output, from[0], 0);
 			niov = 1;
 
 			/* Since there's a gap between the previous and this
@@ -912,28 +1078,31 @@ int process_output_queue(int fd,
 			return 1;
 
 		/* Write the buffers to $fd. */
+		assert(tasks > from);
 		if (!xpwritev(fd, output->iov, niov,
-				(off_t)dst->blocksize * first, // OK
+				(off_t)dst->blocksize * LBA_OF(from[0]),
 				need_to_seek))
 			die("%s: %m", dst->fname ? dst->fname : "(stdout)");
 
-		/* Delete output buffers. */
-		for (t = from_task; t < tasks; t++)
+		/* Delete output buffers [$from..$tasks[. */
+		for (t = from; t < tasks; t++)
 			scsi_free_scsi_task(*t);
-		memmove(from_task, tasks, sizeof(*tasks) * ntasks);
-		output->enqueued -= tasks - from_task;
-		tasks = from_task;
+		memmove(from, tasks, sizeof(*tasks) * ntasks);
+		output->enqueued -= tasks - from;
 
-		/* If we've flushed the first possible batch, update
-		 * $output->top_block, which then will point to the start
-		 * of the next possible batch. */
-		if (output->top_block == first)
-			output->top_block = block;
-		first = block;
+		/* Are we done with all $tasks? */
+		if (!ntasks)
+			return 1;
+
+		/* Now $from points at the first unvisited task.
+		 * Continue from that point. */
+		tasks = from;
+		block = LBA_OF(from[0]);
 
 		/* Keep $need_to_seek, because pwrite*() doesn't change
 		 * the file offset. */
 		niov = 0;
+		goto middle;
 	} /* until all batches are output or skipped */
 
 	return 0;
@@ -966,10 +1135,12 @@ void chunk_written(struct iscsi_context *iscsi, int status,
 	} else
 		scsi_free_scsi_task(task);
 
-	if (Opt_write_progress && !(chunk->srcblock % Opt_write_progress))
-		info("source block %u copied", chunk->srcblock);
+	assert(chunk->address <= Last.writing);
+	assert(Last.written <= Last.writing);
+	if (Last.written < chunk->address)
+		Last.written = chunk->address;
 
-	chunk->srcblock = 0;
+	chunk->address = 0;
 	assert(!chunk->time_to_retry);
 	if (REMOTE_TO_REMOTE(input))
 	{
@@ -991,7 +1162,7 @@ void chunk_read(struct iscsi_context *iscsi, int status,
 	assert(!chunk->read_task);
 
 	assert(task != NULL);
-	assert(LBA_OF(task) == chunk->srcblock);
+	assert(LBA_OF(task) == chunk->address);
 
 	assert(chunk->input->nreqs > 0);
 	chunk->input->nreqs--;
@@ -1003,9 +1174,10 @@ void chunk_read(struct iscsi_context *iscsi, int status,
 		return;
 	}
 
-	chunk->input->nread += task->datain.size;
-	if (Opt_read_progress && !(chunk->srcblock % Opt_read_progress))
-		info("source block %u read", chunk->srcblock);
+	assert(chunk->address <= Last.reading);
+	assert(Last.red <= Last.reading);
+	if (Last.red < chunk->address)
+		Last.red = chunk->address;
 
 	chunk->read_task = task;
 	assert(!chunk->time_to_retry);
@@ -1015,7 +1187,16 @@ void chunk_read(struct iscsi_context *iscsi, int status,
 		return;
 	}
 
-	/* REMOTE_TO_REMOTE() */
+	assert(REMOTE_TO_REMOTE(chunk->input));
+	if (chunk->input->src->blocksize != dst->blocksize)
+	{	/* Translate source address to destination address. */
+		off_t n;
+
+		n = (off_t)chunk->address * chunk->input->src->blocksize;
+		assert(n % dst->blocksize == 0);
+		chunk->address = n / dst->blocksize;
+	}
+
 	if (!(chunk->input->output->nreqs < chunk->input->dst->maxreqs))
 	{	/* Maximum outstanding write requests reached,
 		 * write $chunk later. */
@@ -1023,12 +1204,11 @@ void chunk_read(struct iscsi_context *iscsi, int status,
 		return;
 	}
 
-	assert(task->datain.size > 0);
-	assert(task->datain.size % dst->blocksize == 0); // OK
-	if (!iscsi_write10_task(
-		dst->iscsi, dst->url->lun,
+	if (Last.writing < chunk->address)
+		Last.writing = chunk->address;
+
+	if (!write_endpoint(dst, chunk->address,
 		task->datain.data, task->datain.size,
-		chunk->srcblock, 0, 0, dst->blocksize, // OK
 		chunk_written, chunk))
 	{
 		warn_iscsi("write10", dst->iscsi);
@@ -1036,6 +1216,68 @@ void chunk_read(struct iscsi_context *iscsi, int status,
 	} else
 		chunk->input->output->nreqs++;
 }
+
+/* Return the optimal number of bytes to read/write [$from..$until] blocks
+ * taking the target's optimal transfer size and granuality into account. */
+size_t read_chunk_size(
+	struct endpoint_st const *src, struct endpoint_st const *dst,
+	scsi_block_addr_t from, scsi_block_addr_t until)
+{
+	scsi_block_count_t nblocks;
+	struct endpoint_st const *endp;
+
+	assert(from < until);
+	if (src && !src->iscsi)
+		src = NULL;
+	if (dst && !dst->iscsi)
+		dst = NULL;
+	assert(src || dst);
+
+	endp = src ? src : dst;
+	assert(endp->optimum > 0);
+	assert(endp->granuality > 0);
+
+	if (src && dst)
+	{	/* We also have to take $dst into account. */
+		size_t n;
+
+		/* We have precisely two choices: either read $src->optimum
+		 * blocks or $until end of the source disk. */
+		nblocks = until - from;
+		if (nblocks > src->optimum)
+			nblocks = src->optimum;
+
+		/* $src->optimum was chosen so that it's a multiply
+		 * of $dst->blocksize, so $nblocks must be suitable. */
+		n = (size_t)src->blocksize * nblocks;
+		assert(n % dst->blocksize == 0);
+		return n;
+	} else
+	{	/* We have a single $endp:oint to consider. */
+		/* If $from is not at $optimum boundary, progress until
+		 * that point.* Otherwise read/write $optimum number of
+		 * blocks. */
+		nblocks = from % endp->optimum;
+		nblocks = nblocks > 0
+			? endp->optimum - nblocks
+			: endp->optimum;
+
+		/* Make sure we're not reading/writing
+		 * beyond the target's capacity. */
+		if (from + nblocks > until)
+		    nblocks = until - from;
+
+		/* If $nblocks is not optimal, try to make it
+		 * a multiple of $granuality. */
+		if (nblocks % endp->optimum != 0
+				&& nblocks > endp->granuality
+				&& nblocks % endp->granuality > 0)
+			nblocks -= nblocks % endp->granuality;
+
+		assert(nblocks > 0);
+		return (size_t)endp->blocksize * nblocks;
+	}
+} /* read_chunk_size */
 
 int restart_requests(struct input_st *input,
 	callback_t read_cb, callback_t write_cb)
@@ -1071,14 +1313,13 @@ int restart_requests(struct input_st *input,
 				continue;
 			}
 
-			assert(read_cb != NULL);
 			if (Opt_verbosity > 1)
 				info("re-reading source block %u",
-					chunk->srcblock);
-			if (!iscsi_read10_task(
-				src->iscsi, src->url->lun,
-				chunk->srcblock, src->blocksize, // TBD
-				src->blocksize, read_cb, chunk)) // OK
+					chunk->address);
+			if (!read_endpoint(src, chunk->address,
+				read_chunk_size(src, dst,
+					chunk->address, input->until),
+				read_cb, chunk))
 			{	/* It must be some fatal error, eg. OOM. */
 				warn_iscsi("read10", src->iscsi);
 				return 0;
@@ -1087,7 +1328,7 @@ int restart_requests(struct input_st *input,
 		} else	/* LOCAL_TO_REMOTE() || $chunk->read_task */
 		{	/* Rewrite */
 			size_t sbuf;
-			unsigned char *buf;
+			unsigned char const *buf;
 
 			assert(!REMOTE_TO_LOCAL(input));
 			if (!(output->nreqs < dst->maxreqs))
@@ -1098,34 +1339,32 @@ int restart_requests(struct input_st *input,
 
 			if (Opt_verbosity > 1)
 				info("rewriting source block %u",
-					chunk->srcblock);
+					chunk->address);
 
 			if (IS_SEXYWRAP(input))
 			{	/* $buf points to some user buffer. */
-				buf  = chunk->wbuf;
-				sbuf = dst->blocksize;
+				buf  = chunk->u.wbuf;
+				sbuf = chunk->sbuf;
 			} else if (LOCAL_TO_REMOTE(input))
 			{	/* In this mode the buffer comes right after
 				 * the struct chunk_st. */
-				buf  = chunk->rbuf;
-				sbuf = dst->blocksize;
+				buf  = chunk->u.rbuf;
+				sbuf = chunk->sbuf;
 			} else
 			{	/* REMOTE_TO_REMOTE() */
 				buf  = chunk->read_task->datain.data;
 				sbuf = chunk->read_task->datain.size;
 			}
 
-			assert(write_cb != NULL);
-			if (!iscsi_write10_task(
-				dst->iscsi, dst->url->lun,
-				buf, sbuf, chunk->srcblock, 0, 0,
-				dst->blocksize, write_cb, chunk))
+			if (!write_endpoint(dst,
+				chunk->address, buf, sbuf,
+				write_cb, chunk))
 			{	/* Uncorrectable error. */
 				warn_iscsi("write10", dst->iscsi);
 				return 0;
 			} else
 				output->nreqs++;
-		}
+		} /* what to do with $chunk */
 
 		/* Unlink $chunk from the $failed chain and update $prev,
 		 * $input->failed and $input->last_failed. */
@@ -1157,25 +1396,26 @@ int start_iscsi_read_requests(struct input_st *input, callback_t read_cb)
 		&& input->top_block < input->until)
 	{
 		struct chunk_st *chunk;
+		size_t this_chunk_size;
 
 		chunk = input->unused;
 		assert(!chunk->read_task);
 		assert(!chunk->time_to_retry);
 
-		if (Opt_verbosity > 2
-				&& Opt_read_progress
-				&& !(input->top_block % Opt_read_progress))
-			info("reading source block %u", input->top_block);
-
-		if (!iscsi_read10_task( // XXX check usage of blocksize
-			src->iscsi, src->url->lun,
-			input->top_block, src->blocksize,
-			src->blocksize, read_cb, chunk))
+		this_chunk_size = read_chunk_size(src, input->dst,
+			input->top_block, input->until);
+		if (!read_endpoint(src, input->top_block,
+			this_chunk_size, read_cb, chunk))
 		{
 			warn_iscsi("read10", src->iscsi);
 			return 0;
 		}
-		chunk->srcblock = input->top_block++;
+
+		chunk->address = input->top_block;
+		input->top_block += this_chunk_size / src->blocksize;
+
+		assert(!Last.reading || Last.reading < chunk->address);
+		Last.reading = chunk->address;
 
 		/* Detach $chunk from $input->unused. */
 		input->nreqs++;
@@ -1227,7 +1467,7 @@ void free_surplus_unused_chunks(struct input_st *input)
 	}
 }
 
-void reduce_maxreqs(struct endpoint_st *endp, char const *which)
+void reduce_maxreqs(char const *which, struct endpoint_st *endp)
 {
 	unsigned maxreqs;
 
@@ -1311,47 +1551,52 @@ int init_input(struct input_st *input, struct output_st *output,
 	struct endpoint_st *src, struct endpoint_st *dst)
 {
 	unsigned nchunks;
-	size_t inline_buf_size;
+	size_t max_chunk_size;
+	struct chunk_st *chunk;
 
 	memset(input, 0, sizeof(*input));
 	input->src = src;
 	input->dst = dst;
 	input->output = output;
 
-	/*
-	 * If we're copying a local file to a remote target the input buffer
-	 * is allocated together with the $chunk, the size of which is the
-	 * destination device's blocksize.  In this case we need to discount
-	 * the space allocated for the $read_task pointer, because its size
-	 * is included in the size of the structure.
-	 */
+	/* If we're copying a local file to a remote target the input buffer
+	 * is allocated together with the $chunk, the maximum size of which
+	 * is the optimal transfer size of the destination device. */
+	max_chunk_size = sizeof(*chunk);
 	if (!IS_SEXYWRAP(input) && LOCAL_TO_REMOTE(input))
-	{
-		assert(dst->blocksize > sizeof(struct scsi_task *));
-		inline_buf_size = dst->blocksize - sizeof(struct scsi_task *);
-	} else
-		inline_buf_size = 0;
+	{	/* Discount sizeof(wbuf). */
+		max_chunk_size -= sizeof(chunk->u);
+		max_chunk_size += (size_t)dst->blocksize * dst->optimum;
+	}
 
 	/* Create $input->input chunks. */
 	nchunks = 0;
-	if (src)
+	if (src && src->iscsi)
 		nchunks += src->maxreqs;
-	if (dst)
+	if (dst && dst->iscsi)
 		nchunks += dst->maxreqs;
 	for (; nchunks > 0; nchunks--)
 	{
-		struct chunk_st *chunk;
-
-		if (!(chunk = malloc(sizeof(*chunk) + inline_buf_size)))
+		if (!(chunk = malloc(max_chunk_size)))
 		{
 			free_chunks(input->unused);
 			return 0;
 		} else
-			memset(chunk, 0, sizeof(*chunk) + inline_buf_size);
+			memset(chunk, 0, max_chunk_size);
 
 		chunk->input = input;
 		return_chunk(chunk);
 	} /* until $nchunks unused chunks are created */
+
+	/* These are zero when the program starts... */
+	if (IS_SEXYWRAP(input))
+	{	/* ...but need to be cleared again when sexywrap
+		 * uses us the next time. */
+		memset(&Prev, 0, sizeof(Prev));
+		memset(&Last, 0, sizeof(Last));
+		memset(&Last_report, 0, sizeof(Last_report));
+		memset(&Now, 0, sizeof(Now));
+	}
 
 	return 1;
 } /* init_input */
@@ -1414,6 +1659,36 @@ int reconnect_endpoint(struct endpoint_st *endp)
 		return connect_endpoint(endp->iscsi, endp->url);
 }
 
+/* Convenience wrapper around iscsi_read10_task(). */
+struct scsi_task *read_endpoint(struct endpoint_st const *endp,
+	scsi_block_addr_t block, size_t chunk_size,
+	callback_t read_cb, struct chunk_st *chunk)
+{
+	assert(read_cb != NULL);
+	assert(chunk_size >= endp->blocksize);
+	assert(chunk_size % endp->blocksize == 0);
+	return iscsi_read10_task(
+		endp->iscsi, endp->url->lun,
+		block, chunk_size, endp->blocksize,
+		read_cb, chunk);
+}
+
+/* Convenience wrapper around iscsi_write10_task(). */
+struct scsi_task *write_endpoint(struct endpoint_st const *endp,
+	scsi_block_addr_t block, void const *buf, size_t sbuf,
+	callback_t write_cb, struct chunk_st *chunk)
+{
+	assert(write_cb != NULL);
+	assert(sbuf >= endp->blocksize);
+	assert(sbuf % endp->blocksize == 0);
+	return iscsi_write10_task(
+		endp->iscsi, endp->url->lun,
+		(void *)buf, sbuf, block,
+		0, 0,
+		endp->blocksize,
+		write_cb, chunk);
+}
+
 void destroy_endpoint(struct endpoint_st *endp)
 {
 	if (endp->iscsi)
@@ -1430,13 +1705,127 @@ void destroy_endpoint(struct endpoint_st *endp)
 	}
 }
 
-int stat_endpoint(struct endpoint_st *endp, char const *which)
+/* Print the target's capacity and characteristics. */
+void print_endpoint(char const *which, struct endpoint_st const *endp)
+{
+	printf("%s target: nblocks=%u, blocksize=%u, "
+		"granuality=%u, optimum=%u, maximum=%u\n",
+		which, endp->nblocks, endp->blocksize,
+		endp->granuality, endp->optimum, endp->maximum);
+} /* print_endpoint */
+
+/* Calculate the optimal transfer size based on the target's preferences.
+ * $endp is assumed to be initialized with stat_endpoint(). */
+void calibrate_endpoint(struct endpoint_st *endp,
+	scsi_block_count_t desired_optimum)
+{
+	/* The fallback optimal transfer size in bytes. */
+	const size_t dflt_optimum = 1024*1024;
+
+	if (desired_optimum)
+		/* User gave a $desired_optimum, override the device's. */
+		endp->optimum = desired_optimum;
+
+	/*
+	 * Adjust $endp->optimum and $granuality, honoring $maximum
+	 * if provided.
+	 *
+	 * optimum	maximum		granuality {{{
+	 * 0		0		0		[0]
+	 * 0		0		1		[1]
+	 * 0		1		0		[2]
+	 * 0		1		1		[2]
+	 * 1		1		0		[3]
+	 * 1		1		1		[3]
+	 * 1		0		0		[4]
+	 * 1		0		1		[5]
+	 *
+	 * (0) zero
+	 * (1) non-zero (provided by the device) }}}
+	 */
+	if (!endp->optimum && !endp->maximum && !endp->granuality)
+	{	/* [0] No usable information returned, calibrate
+		 * $endp->optimum to be close to $dflt_optimum
+		 * while honoring $endp->blocksize. */
+		endp->optimum = dflt_optimum >= endp->blocksize*2
+			? dflt_optimum / endp->blocksize
+			: 1;
+		/* All $optimum, $maximum and $granuality are set. */
+	} else if (!endp->optimum && !endp->maximum)
+	{	/* [1] We only have $endp->granuality. */
+		size_t granuality;
+
+		/* Calibrate $optimum to be ~$dflt_optimum,
+		 * but respect $endp->granuality. */
+		granuality = (size_t)endp->blocksize * endp->granuality;
+		if (granuality >= dflt_optimum)
+			/* $optimum <- >= $dflt_optimum */
+			endp->optimum = endp->granuality;
+		else if (dflt_optimum >= granuality*2)
+		{	/* $optimum <- <integer>*$endp->granuality */
+			endp->optimum  = dflt_optimum / granuality;
+			endp->optimum *= endp->granuality;
+		} else	/* $dflt_optimum < 2*$granuality */
+			endp->optimum = endp->granuality;
+		/* $optimum is set, $granuality was provided. */
+	} else if (!endp->optimum)
+	{	/* [2] We must have $endp->maximum. */
+		if (!endp->granuality)
+		{	/* Neither $optimum nor $granuality is specified. */
+			endp->granuality = 1;
+			endp->optimum = endp->maximum;
+		} else if (endp->granuality >= endp->maximum)
+		{	/* $endp->granuality is too large. */
+			endp->optimum = endp->maximum;
+			endp->granuality = endp->maximum;
+		} else if (endp->granuality*2 < endp->maximum)
+		{	/* $optimum = <integer> * $granuality */
+			endp->optimum  = endp->maximum;
+			endp->optimum /= endp->granuality;
+		} else	/*   $granuality <= $maximum, but
+			 * 2*$granuality >  $maximum */
+			endp->optimum = endp->granuality;
+		/* $optimum is set, $granuality is verified/set. */
+	} else if (endp->maximum)
+	{	/* [3] We have $endp->optimum, verify it. */
+		if (endp->optimum > endp->maximum)
+			endp->optimum = endp->maximum;
+
+		/* Verify/set $endp->granuality. */
+		if (!endp->granuality)
+			endp->granuality = endp->optimum;
+		else if (endp->granuality > endp->maximum)
+			endp->granuality = endp->optimum;
+
+		/* Both $optimum and $granuality are verified/set. */
+	} else if (!endp->granuality)
+	{	/* [4] We do _not_ have $endp->maximum. */
+		endp->granuality = endp->optimum;
+		/* $optimum was provided, $granuality is set. */
+	} else	/* [5] */
+		/* Both $optimum and $granuality were provided. */;
+
+	/* $maximum might not be set, but if it is, it's enforced.
+	 * $granuality could be > than $optimum, even though that
+	 * doesn't make much sense. */
+	assert(endp->optimum > 0);
+	assert(endp->granuality > 0);
+	if (endp->maximum)
+	{
+		assert(endp->optimum <= endp->maximum);
+		assert(endp->granuality <= endp->maximum);
+	}
+} /* calibrate_endpoint */
+
+/* Get the target endpoint's capacity and characteristics. */
+int stat_endpoint(char const *which, struct endpoint_st *endp,
+	unsigned fallback_blocksize)
 {
 	struct scsi_task *task;
 	struct scsi_readcapacity10 *cap;
 	struct scsi_inquiry_block_limits *__attribute__((unused)) inq;
 
-	/* Get the endpoint's nblocks and blocksize. */
+	/* Retrieve the $endp:oint's capacity. */
 	if (!(task = iscsi_readcapacity10_sync(endp->iscsi, endp->url->lun,
 		0, 0)))
 	{
@@ -1450,69 +1839,41 @@ int stat_endpoint(struct endpoint_st *endp, char const *which)
 		return 0;
 	}
 
-	/* We need a useful blocksize.  I think 512 byte blocks
-	 * should be supported by all SCSI devices. */
-	endp->blocksize = cap->block_size;
-	if (endp->blocksize < 512)
+	/* Get $blocksize and $nblocks. */
+	if (!cap->block_size)
 	{
+		endp->blocksize = fallback_blocksize;
+		if (!endp->blocksize)
+			endp->blocksize = 512;
 		if (Opt_verbosity > 0)
-			warn("%s target reported blocksize=%u, ignored",
-				which, endp->blocksize);
-		endp->blocksize = 512;
-	}
+			warn("%s target reported zero blocksize, "
+				"using %u instead", which, endp->blocksize);
+	} else
+		endp->blocksize = cap->block_size;
 	endp->nblocks = cap->lba + 1;
 	scsi_free_scsi_task(task);
 
-#if 0	/* Unused at the moment. */
-	/* Get the optimal transfer amounts. */
-	if (!(task = iscsi_inquiry_sync(endp->iscsi, endp->url->lun,
-		1, SCSI_INQUIRY_PAGECODE_BLOCK_LIMITS, sizeof(*inq))))
-	{
+	/* Get $endp->optimum, $maximum and $granuality. */
+	if ((task = iscsi_inquiry_sync(endp->iscsi, endp->url->lun,
+			1, SCSI_INQUIRY_PAGECODE_BLOCK_LIMITS, sizeof(*inq)))
+		&& (inq = scsi_datain_unmarshall(task)))
+	{	/* These are the raw values, which will be the input
+		 * of calibrate_endpoint(). */
+		endp->optimum = inq->opt_xfer_len;
+		endp->maximum = inq->max_xfer_len;
+		endp->granuality = inq->opt_gran;
+	} else
+	{	/*
+		 * We can't know whether we've suffered a local (OOM)
+		 * or a remote error (command not understood), but the
+		 * former is less likely, so take it as if all zeroes
+		 * were returned.
+		 */
 		warn_iscsi("inquiry", endp->iscsi);
-	} else if (!(inq = scsi_datain_unmarshall(task)))
-	{
-		warn_iscsi("inquiry", endp->iscsi);
-	} else if (inq->max_xfer_len > endp->blocksize
-		&& inq->opt_xfer_len > endp->blocksize)
-	{	/* Ensure $blocksize <= $granuality <= $optimum <= $max. */
-		unsigned max;
-
-		/* $max := max(FLOOR($max_xfer_len), $blocksize) */
-		max = inq->max_xfer_len;
-		max -= max % endp->blocksize;
-
-		/* $granuality := max($blocksize*$opt_gran, $blocksize)
-		 * $granuality := min($granuality, $max) */
-		endp->granuality = endp->blocksize * inq->opt_gran;
-		if (!endp->granuality)
-			endp->granuality = endp->blocksize;
-		else if (endp->granuality > max)
-			endp->granuality = max;
-
-		if (inq->opt_xfer_len)
-		{	/* Make sure $blocksize <= $optimum <= $max. */
-			unsigned rem;
-
-			/* $optimum := FLOOR($opt_xfer_len) */
-			rem = inq->opt_xfer_len % endp->blocksize;
-			endp->optimum = inq->opt_xfer_len - rem;
-
-			/* min($optimum) <- $blocksize
-			 * max($optimum) <- $max */
-			if (!endp->optimum)
-				endp->optimum = endp->blocksize;
-			else if (endp->optimum > max)
-				endp->optimum = max;
-
-			/* max($granuality) <- $optimum */
-			if (endp->granuality > endp->optimum)
-				endp->granuality = endp->optimum;
-		} else	/* $opt_xfer_len == 0 */
-			endp->optimum = endp->granuality;
+		assert(!endp->optimum);
+		assert(!endp->maximum);
+		assert(!endp->granuality);
 	}
-#else
-	task = NULL;
-#endif  /* SCSI_INQUIRY_PAGECODE_BLOCK_LIMITS */
 
 	if (task)
 		scsi_free_scsi_task(task);
@@ -1520,8 +1881,9 @@ int stat_endpoint(struct endpoint_st *endp, char const *which)
 	return 1;
 }
 
-int init_endpoint(struct endpoint_st *endp, char const *which,
-	char const *url)
+int init_endpoint(char const *which,
+	struct endpoint_st *endp, char const *url,
+	unsigned fallback_blocksize)
 {
 	/* Create $endp->iscsi and connect to $endp->url. */
 	if (!(endp->iscsi = iscsi_create_context(endp->initiator)))
@@ -1534,23 +1896,20 @@ int init_endpoint(struct endpoint_st *endp, char const *which,
 		destroy_endpoint(endp);
 		return 0;
 	} else if (!connect_endpoint(endp->iscsi, endp->url)
-		|| !stat_endpoint(endp, which))
+		|| !stat_endpoint(which, endp, fallback_blocksize))
 	{
 		destroy_endpoint(endp);
 		return 0;
-	} else if (Opt_verbosity > 0)
-		info("%s target: blocksize=%u, nblocks=%u",
-			which, endp->blocksize, endp->nblocks);
+	}
 
 	return 1;
 }
 
-#ifdef SEXYCAT
-/* Upload a local file to a remote iSCSI target. */
+#ifdef SEXYCAT /* {{{ */
+/* Upload a local file to a remote iSCSI target. {{{ */
 int local_to_remote(struct input_st *input)
 {
-	off_t maxwrite;
-	int eof, overflow;
+	int eof;
 	struct pollfd pfd[2];
 	struct endpoint_st *src = input->src;
 	struct endpoint_st *dst = input->dst;
@@ -1567,9 +1926,8 @@ int local_to_remote(struct input_st *input)
 	}
 
 	/* Loop until all of $src is written out. */
-	eof = overflow = 0;
+	eof = 0;
 	pfd[1].fd = iscsi_get_fd(dst->iscsi);
-	maxwrite = (off_t)dst->blocksize * dst->nblocks;
 	for (;;)
 	{
 		int ret;
@@ -1578,11 +1936,21 @@ int local_to_remote(struct input_st *input)
 		 * but don't send them to $dst just yet. */
 		if (!restart_requests(input, NULL, chunk_written))
 			return 0;
-		if (eof && !input->output->nreqs && !input->failed)
-			break;
 
-		/* Wait until I/O is possible without blocking. */
-		pfd[0].events = !eof && input->unused ? POLLIN : 0;
+		/* Done if !pending && (eof || disk full) */
+		if (!input->output->nreqs && !input->failed)
+		{
+			if (eof)
+				break;
+			if (!(input->top_block < input->until))
+				break;
+		}
+
+		/* POLLIN <=> !eof && can request && !disk full */
+		pfd[0].events = !eof
+			&& input->unused
+			&& (input->top_block < input->until)
+			? POLLIN : 0;
 		pfd[1].events = iscsi_which_events(dst->iscsi);
 		if ((ret = xfpoll(pfd, MEMBS_OF(pfd), input)) < 0)
 		{
@@ -1594,50 +1962,56 @@ int local_to_remote(struct input_st *input)
 		/* Read $src if we can and create an iSCSI write request. */
 		if (pfd[0].revents & POLLIN)
 		{	/* We must have been waiting for POLLIN. */
-			size_t n;
+			size_t max_chunk_size;
 			struct chunk_st *chunk;
 
-			/* read($src) */
+			/* $chunk <- read($src, $max_chunk_size) */
+			assert(pfd[0].events & POLLIN);
 			assert(input->unused != NULL);
 			chunk = input->unused;
-			if (!xread(pfd[0].fd,chunk->rbuf,dst->blocksize,&n))
+			max_chunk_size = read_chunk_size(NULL, dst,
+				input->top_block, input->until);
+			assert(max_chunk_size
+				<= (size_t)dst->blocksize * dst->optimum);
+			if (!xread(pfd[0].fd, chunk->u.rbuf,
+				max_chunk_size, &chunk->sbuf))
 			{
 				warn_errno(src->fname
 					? src->fname : "(stdin)");
 				return 0;
-			}
-
-			/* Make sure we're within the target's capacity. */
-			if (n > maxwrite)
-			{	/* Can't write as much as $n bytes. */
-				overflow = 1;
-				n = maxwrite;
-				if (n < dst->blocksize)
-					/* Can't write anything more. */
-					n = 0;
-			}
+			} else if (chunk->sbuf % dst->blocksize > 0)
+			{	/* We can't write a partial block.
+				 * Take it as $eof. */
+				warn("last %zu bytes of input dropped",
+					chunk->sbuf % dst->blocksize);
+				assert(chunk->sbuf < max_chunk_size);
+				chunk->sbuf -= chunk->sbuf % dst->blocksize;
+				eof = 1;
+			} else	/* It may or may not be $eof. */
+				assert(chunk->sbuf <= max_chunk_size);
 
 			/* Is it $eof on $src? */
-			if (n > 0)
+			if (chunk->sbuf > 0)
 			{	/* Remove $chunk from $input->unused. */
 				take_chunk(chunk);
-				chunk->srcblock = input->top_block++;
+				chunk->address = input->top_block;
+				input->top_block +=
+					chunk->sbuf / dst->blocksize;
 
 				/* We needn't check whether $dst->maxreqs is
 				 * exceeded, because this case we would have
 				 * been out of $input->unused chunks. */
 				assert(input->output->nreqs
 					< input->dst->maxreqs);
-				assert(n >= dst->blocksize);
-				assert(n <= maxwrite);
-				maxwrite -= n;
+
+				assert(!Last.writing
+					|| Last.writing < chunk->address);
+				Last.writing = chunk->address;
 
 				/* Create the iSCSI write request. */
-				if (!iscsi_write10_task(
-					dst->iscsi, dst->url->lun,
-					chunk->rbuf, dst->blocksize,
-					chunk->srcblock, 0, 0,
-					dst->blocksize, chunk_written, chunk))
+				if (!write_endpoint(dst, chunk->address,
+					chunk->u.rbuf, chunk->sbuf,
+					chunk_written, chunk))
 				{
 					warn_iscsi("write10", dst->iscsi);
 					die(NULL);
@@ -1663,7 +2037,7 @@ int local_to_remote(struct input_st *input)
 		{	/* Connection problem, reconnect. */
 			if (!reconnect_endpoint(dst))
 				return 0;
-			reduce_maxreqs(dst, "destination");
+			reduce_maxreqs("destination", dst);
 			free_surplus_unused_chunks(input);
 		}
 	} /* until $eof is reached and everything is written out */
@@ -1671,17 +2045,10 @@ int local_to_remote(struct input_st *input)
 	/* Close the input file if we opened it. */
 	if (src->fname)
 		close(pfd[0].fd);
+	return 1;
+} /* local_to_remote }}} */
 
-	if (overflow)
-	{
-		warn("only %ld bytes could be written",
-			(off_t)dst->blocksize * dst->nblocks - maxwrite);
-		return 0;
-	} else
-		return 1;
-} /* local_to_remote */
-
-/* Download from a remote iSCSI target to a local file. */
+/* Download from a remote iSCSI target to a local file. {{{ */
 int remote_to_local(struct input_st *input, unsigned output_flags)
 {
 	struct stat sbuf;
@@ -1775,7 +2142,7 @@ int remote_to_local(struct input_st *input, unsigned output_flags)
 		{	/* Connection problem, reconnect. */
 			if (!reconnect_endpoint(src))
 				return 0;
-			reduce_maxreqs(src, "source");
+			reduce_maxreqs("source", src);
 			free_surplus_unused_chunks(input);
 		}
 
@@ -1788,16 +2155,15 @@ int remote_to_local(struct input_st *input, unsigned output_flags)
 	} /* until $eof is reached and everything is written out */
 
 	assert(input->top_block == input->until);
-	assert(input->nread == (off_t)src->blocksize * src->nblocks);
 
 	/* Close the input file if we opened it. */
 	if (dst->fname)
 		close(pfd[1].fd);
 
 	return 1;
-} /* remote_to_local */
+} /* remote_to_local }}} */
 
-/* Copy between remote iSCSI targets. */
+/* Copy between remote iSCSI targets. {{{ */
 int remote_to_remote(struct input_st *input)
 {
 	struct pollfd pfd[2];
@@ -1840,7 +2206,7 @@ int remote_to_remote(struct input_st *input)
 		{
 			if (!reconnect_endpoint(src))
 				return 0;
-			reduce_maxreqs(src, "source");
+			reduce_maxreqs("source", src);
 			free_surplus_unused_chunks(input);
 		}
 
@@ -1855,17 +2221,16 @@ int remote_to_remote(struct input_st *input)
 		{
 			if (!reconnect_endpoint(dst))
 				return 0;
-			reduce_maxreqs(dst, "destination");
+			reduce_maxreqs("destination", dst);
 			free_surplus_unused_chunks(input);
 		}
 	} /* until $src->until is reached and everything is written out */
 
 	assert(input->top_block == input->until);
-	assert(input->nread == (off_t)src->blocksize * src->nblocks);
 	return 1;
-} /* remote_to_remote */
+} /* remote_to_remote }}} */
 
-/* The main function */
+/* The main function {{{ */
 int main(int argc, char *argv[])
 {
 	struct
@@ -1876,6 +2241,10 @@ int main(int argc, char *argv[])
 			char const *url;
 			char const *fname;
 		};
+
+		size_t fallback_blocksize;
+		scsi_block_count_t desired_optimum;
+
 		struct endpoint_st endp;
 	} src, dst;
 	int isok, optchar, nop;
@@ -1918,7 +2287,8 @@ int main(int argc, char *argv[])
 #else
 # define SEXYWRAP_CMDLINE			/* none */
 #endif
-	optstring = "hvqi:s:S:p:m:I:d:D:P:OM:b:B:r:R:N" SEXYWRAP_CMDLINE ;
+	optstring = "hvqp:i:s:S:f:c:m:I:d:D:F:C:M:Ob:B:r:R:N"
+		SEXYWRAP_CMDLINE;
 
 	while ((optchar = getopt(argc, argv, optstring)) != EOF)
 		switch (optchar)
@@ -1928,6 +2298,18 @@ int main(int argc, char *argv[])
 			break;
 		case 'q':
 			Opt_verbosity--;
+			break;
+		case 'p':
+			if (sscanf(optarg, "%ums%n", &Opt_progress,
+				&optchar) != 1 || optchar != strlen(optarg))
+			{	/* Convert seconds to milliseconds. */
+				if (sscanf(optarg, "%u%n", &Opt_progress,
+							&optchar) != 1
+				    		|| optchar != strlen(optarg))
+					die("-p: not an integer");
+				else
+					Opt_progress *= 1000;
+			}
 			break;
 
 		/* Source-related options */
@@ -1942,11 +2324,17 @@ int main(int argc, char *argv[])
 			src.is_local = 1;
 			src.fname = optarg;
 			break;
-		case 'p':
-			Opt_read_progress = atoi(optarg);
+		case 'f':
+			src.fallback_blocksize = atoi(optarg);
+			dst.fallback_blocksize = src.fallback_blocksize;
+			break;
+		case 'c':
+			src.desired_optimum = atoi(optarg);
+			dst.desired_optimum = src.desired_optimum;
 			break;
 		case 'm':
 			src.endp.maxreqs = atoi(optarg);
+			dst.endp.maxreqs = src.endp.maxreqs;
 			break;
 
 		/* Destination-related options */
@@ -1961,15 +2349,18 @@ int main(int argc, char *argv[])
 			dst.is_local = 1;
 			dst.fname = optarg;
 			break;
+		case 'M':
+			dst.endp.maxreqs = atoi(optarg);
+			break;
+		case 'F':
+			dst.fallback_blocksize = atoi(optarg);
+			break;
+		case 'C':
+			dst.desired_optimum = atoi(optarg);
+			break;
 		case 'O':
 			output_flags &= ~O_EXCL;
 			output_flags |= O_TRUNC;
-			break;
-		case 'P':
-			Opt_write_progress = atoi(optarg);
-			break;
-		case 'M':
-			dst.endp.maxreqs = atoi(optarg);
 			break;
 
 		/* Error recovery */
@@ -2104,8 +2495,11 @@ int main(int argc, char *argv[])
 	if (src.is_local)
 		/* LOCAL_TO_REMOTE() */
 		src.endp.fname = src.fname;
-	else if (!init_endpoint(&src.endp, "source", src.url))
+	else if (!init_endpoint("source", &src.endp, src.url,
+			src.fallback_blocksize))
 		die(NULL);
+	else if (dst.is_local)
+		calibrate_endpoint(&src.endp, src.desired_optimum);
 	if (dst.is_local)
 	{	/* REMOTE_TO_LOCAL() */
 		if (!dst.fname || !strcmp(dst.fname, "-"))
@@ -2124,30 +2518,112 @@ int main(int argc, char *argv[])
 		output.max = Opt_max_output_queue;
 		output.iov = xmalloc(sizeof(*output.iov) * output.max);
 		output.tasks = xmalloc(sizeof(*output.tasks) * output.max);
-	} else if (!init_endpoint(&dst.endp, "destination", dst.url))
+	} else if (!init_endpoint("destination", &dst.endp, dst.url,
+			dst.fallback_blocksize))
 		die(NULL);
-	if (!src.is_local && !dst.is_local)
-	{	/* REMOTE_TO_REMOTE().   Unfortunately we can't accept
-		 * arbitrary blocksizes, because we can't split/merge
-		 * chunks. */
-		if (dst.endp.blocksize > src.endp.blocksize)
-			die("source target's blocksize must be at least "
-				"as large as the destination's");
-		else if (src.endp.blocksize % dst.endp.blocksize)
-			die("source target's blocksize must be a multiply "
-				"of the destination's");
-	}
+	else if (src.is_local)
+		calibrate_endpoint(&dst.endp, dst.desired_optimum);
 
+	if (!nop && !src.is_local && !dst.is_local)
+	{	/* REMOTE_TO_REMOTE(). */
+		if ((off_t)src.endp.blocksize * src.endp.nblocks
+			> (off_t)dst.endp.blocksize * dst.endp.nblocks)
+		{	/* $src > $dst */
+			src.endp.nblocks =
+				(off_t)dst.endp.blocksize * dst.endp.nblocks
+				/ src.endp.blocksize;
+			warn("only the first %u blocks will be copied",
+				src.endp.nblocks);
+		} else if ((off_t)src.endp.blocksize * src.endp.nblocks
+				% dst.endp.blocksize != 0)
+			/* TODO We can't write partial blocks. */
+			die("amount to copy is not divisable by the "
+				"destination's block size");
+
+		/* Make $to->maximum <= $from->maximum and enforce it. */
+		void set_maximum(struct endpoint_st *to,
+			struct endpoint_st const *from)
+		{
+			if (to->maximum && from->maximum
+					&& to->maximum > from->maximum)
+				to->maximum = from->maximum;
+
+			if (!to->maximum)
+				return;
+			if (to->optimum > to->maximum)
+				to->optimum = to->maximum;
+			if (to->granuality > to->maximum)
+				to->granuality = to->maximum;
+		} /* set_maximum */
+
+		/* $to->optimum <- $from->optimum if $to->blocksize allows. */
+		int set_optimum(struct endpoint_st *to,
+			struct endpoint_st const *from)
+		{
+			off_t optimum;
+
+			if (!from->optimum)
+				return 0;
+
+			/* Is $from's $optimum dividable by $to->blocksize? */
+			optimum = (off_t)from->blocksize * from->optimum;
+			if (optimum % to->blocksize != 0)
+				return 0;
+
+			to->optimum = optimum / to->blocksize;
+			return 1;
+		} /* set_optimum */
+
+		/* Set the desired chunk sizes before set_maximum(),
+		 * so they can be adjusted if needed. */
+		if (src.desired_optimum)
+			src.endp.optimum = src.desired_optimum;
+		if (dst.desired_optimum)
+			dst.endp.optimum = dst.desired_optimum;
+
+		/* Both endpoint's $maximum <- minimum($src, $dst). */
+		set_maximum(&src.endp, &dst.endp);
+		set_maximum(&dst.endp, &src.endp);
+
+		/*
+		 * First try to use the destination's $optimum (because
+		 * writing is supposed to be the heavier operation),
+		 * otherwise the source's one.  Ask the user to specify
+		 * if none works.
+		 */
+		if (!set_optimum(&src.endp, &dst.endp)
+				&& !set_optimum(&dst.endp, &src.endp))
+			die("couldn't figure out a good transfer size, "
+				"please specify it manually with -cC");
+
+		/* Set up the $granuality of the endpoints. */
+		calibrate_endpoint(&src.endp, 0);
+		calibrate_endpoint(&dst.endp, 0);
+
+		/* These conditions have to be met for read_chunk_size()
+		 * to choose a chunk size appropriate for both targets. */
+		assert((off_t)src.endp.blocksize * src.endp.optimum
+				% dst.endp.blocksize == 0);
+		assert((off_t)src.endp.blocksize * src.endp.nblocks
+				% dst.endp.blocksize == 0);
+	} /* REMOTE_TO_REMOTE() */
+
+	/* Read/write all blocks of the disk. */
 	if (!init_input(&input, &output, &src.endp, &dst.endp))
 		die("malloc: %m");
-	if (!LOCAL_TO_REMOTE(&input))
-		/* Read all blocks of the disk. */
-		input.until = src.endp.nblocks;
+	input.until = LOCAL_TO_REMOTE(&input)
+		? dst.endp.nblocks : src.endp.nblocks;
+	clock_gettime(CLOCK_MONOTONIC, &Start);
 
 	/* Run */
 	if (nop)
+	{	/* Just print the capacity of the targets. */
+		if (!src.is_local)
+			print_endpoint("source", &src.endp);
+		if (!dst.is_local)
+			print_endpoint("destination", &dst.endp);
 		isok = 1;
-	else if (LOCAL_TO_REMOTE(&input))
+	} else if (LOCAL_TO_REMOTE(&input))
 		isok = local_to_remote(&input);
 	else if (REMOTE_TO_LOCAL(&input))
 		isok = remote_to_local(&input, output_flags);
@@ -2169,10 +2645,21 @@ int main(int argc, char *argv[])
 	done_input(&input);
 	destroy_endpoint(&src.endp);
 	destroy_endpoint(&dst.endp);
+	if (output.tasks)
+	{
+		unsigned i;
+
+		/* These are neither allocated by init_input()
+		 * nor freed by done_input(). */
+		for (i = 0; i < output.enqueued; i++)
+			scsi_free_scsi_task(output.tasks[i]);
+		free(output.tasks);
+		free(output.iov);
+	}
 
 	exit(!isok);
-} /* main */
-#endif /* SEXYCAT */
+} /* main }}} */
+#endif /* SEXYCAT }}} */
 
 /* vim: set foldmarker={{{,}}} foldmethod=marker: */
 /* End of sexycat.c */
