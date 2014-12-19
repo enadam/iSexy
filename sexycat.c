@@ -184,8 +184,11 @@
 #define MEMBS_OF(ary)			(sizeof(ary) / sizeof((ary)[0]))
 
 /* Shortcuts */
-#define LBA_OF(task)			((task)->params.read10.lba)
-#define LBA_OF_CHUNK(chunk)		LBA_OF((chunk)->read_task)
+#ifdef LIBISCSI_API_VERSION
+# define LBA_OF(task)			(((struct scsi_read10_cdb const *)((task)->ptr))->lba)
+#else
+# define LBA_OF(task)			((task)->params.read10.lba)
+#endif
 
 /*
  * IS_SEXYWRAP():	return whether we're operating on behalf of sexywrap
@@ -241,6 +244,9 @@ typedef void (*callback_t)(struct iscsi_context *iscsi, int status,
 /* Represents an iSCSI/local source/destination. */
 struct endpoint_st
 {
+	/* Is this the source or destination endpoint?  Used for loggging. */
+	char const *which;
+
 	union
 	{
 		/* Input/output file name if the endpoint is local. */
@@ -442,6 +448,7 @@ static void __attribute__((nonnull(2)))
 static void __attribute__((noreturn, format(printf, 1, 2)))
 	die(char const *fmt, ...);
 
+static int get_inode(int fd, ino_t *inodep);
 static unsigned timediff(
 	struct timespec const *later,
 	struct timespec const *earlier);
@@ -450,7 +457,7 @@ static void report_progress(void);
 static void *__attribute__((malloc)) xmalloc(size_t size);
 static void xrealloc(void *ptrp, size_t size);
 static int xpoll(struct pollfd *pfd, unsigned npolls);
-static int xfpoll(struct pollfd *pfd,unsigned npolls, struct input_st *input);
+static int xfpoll(struct pollfd *pfd,unsigned npolls,struct input_st *input);
 static int xread(int fd, unsigned char *buf, size_t sbuf, size_t *nreadp);
 static int xpwritev(int fd, struct iovec *iov, unsigned niov,
 	off_t offset, int seek);
@@ -485,7 +492,7 @@ static int start_iscsi_read_requests(struct input_st *input,
 
 static void free_chunks(struct chunk_st *chunk);
 static void free_surplus_unused_chunks(struct input_st *input);
-static void reduce_maxreqs(char const *which, struct endpoint_st *endp);
+static void reduce_maxreqs(struct endpoint_st *endp);
 static void return_chunk(struct chunk_st *chunk);
 static void take_chunk(struct chunk_st *chunk);
 static void chunk_failed(struct chunk_st *chunk);
@@ -508,13 +515,12 @@ static struct scsi_task *write_endpoint(struct endpoint_st const *endp,
 	callback_t write_cb, struct chunk_st *chunk);
 
 static void destroy_endpoint(struct endpoint_st *endp);
-static void print_endpoint(char const *which, struct endpoint_st const *endp);
+static void print_endpoint(struct endpoint_st const *endp);
 static void calibrate_endpoint(struct endpoint_st *endp,
 	scsi_block_count_t desired_optimum);
-static int stat_endpoint(char const *which, struct endpoint_st *endp,
+static int stat_endpoint(struct endpoint_st *endp,
 	unsigned fallback_blocksize);
-static int init_endpoint(char const *which,
-	struct endpoint_st *endp, char const *url,
+static int init_endpoint(struct endpoint_st *endp, char const *url,
 	unsigned fallback_blocksize);
 
 static int local_to_remote(struct input_st *input);
@@ -650,6 +656,27 @@ void die(char const *fmt, ...)
 
 	exit(1);
 }
+
+/*
+ * Return the i-node number of $fd.  If it's different from *$inodep,
+ * returns 1, otherwise (also in case of error) returns 0.  Used to
+ * find out whether libiscsi reconnected to the target in its event loop.
+ */
+int get_inode(int fd, ino_t *inodep)
+{
+	struct stat sb;
+
+	if (fstat(fd, &sb) < 0)
+	{
+		warn_errno("fstat");
+		return 0;
+	} else if (*inodep != sb.st_ino)
+	{
+		*inodep = sb.st_ino;
+		return 1;
+	} else
+		return 0;
+} /* get_inode */
 
 /* Return $later - $earlier in ms.  It is assumed that $later >= $earlier. */
 unsigned timediff(struct timespec const *later,
@@ -935,7 +962,7 @@ int run_iscsi_event_loop(struct iscsi_context *iscsi, unsigned events)
 
 void add_output_chunk(struct chunk_st *chunk)
 {
-	unsigned lba, i;
+	unsigned i;
 	struct output_st *output = chunk->input->output;
 
 	/* Make room for $chunk in $output->tasks if it's full. */
@@ -953,9 +980,8 @@ void add_output_chunk(struct chunk_st *chunk)
 	/* Find a place for $chunk in $output->tasks in which buffers
 	 * are ordered by LBA. */
 	assert(output->enqueued < output->max);
-	lba = LBA_OF_CHUNK(chunk);
 	for (i = output->enqueued; i > 0; i--)
-		if (LBA_OF(output->tasks[i-1]) < lba)
+		if (LBA_OF(output->tasks[i-1]) < chunk->address)
 			break;
 
 	/* Insert $chunk->read_task into $output->tasks[$i]. */
@@ -1162,6 +1188,11 @@ void chunk_read(struct iscsi_context *iscsi, int status,
 	assert(!chunk->read_task);
 
 	assert(task != NULL);
+
+#ifdef LIBISCSI_API_VERSION
+	/* This will be freed by scsi_free_scsi_task(). */
+	task->ptr = scsi_cdb_unmarshall(task, SCSI_OPCODE_READ10);
+#endif
 	assert(LBA_OF(task) == chunk->address);
 
 	assert(chunk->input->nreqs > 0);
@@ -1467,7 +1498,7 @@ void free_surplus_unused_chunks(struct input_st *input)
 	}
 }
 
-void reduce_maxreqs(char const *which, struct endpoint_st *endp)
+void reduce_maxreqs(struct endpoint_st *endp)
 {
 	unsigned maxreqs;
 
@@ -1488,10 +1519,10 @@ void reduce_maxreqs(char const *which, struct endpoint_st *endp)
 		maxreqs--;
 	endp->maxreqs = maxreqs;
 
-	if (which)
+	if (endp->which)
 		info("%s target: number of maximal "
 			"outstanding requests reduced to %u",
-			which, endp->maxreqs);
+			endp->which, endp->maxreqs);
 }
 
 void return_chunk(struct chunk_st *chunk)
@@ -1650,6 +1681,9 @@ int connect_endpoint(struct iscsi_context *iscsi, struct iscsi_url *url)
 
 int reconnect_endpoint(struct endpoint_st *endp)
 {
+	if (endp->which)
+		warn("reconnecting to %s target...", endp->which);
+
 	iscsi_destroy_context(endp->iscsi);
 	if (!(endp->iscsi = iscsi_create_context(endp->initiator)))
 	{
@@ -1657,6 +1691,14 @@ int reconnect_endpoint(struct endpoint_st *endp)
 		return 0;
 	} else
 		return connect_endpoint(endp->iscsi, endp->url);
+}
+
+int run_endpoint(struct endpoint_st *endp, unsigned events)
+{
+	if (is_connection_error(endp->iscsi, endp->which, events))
+		return reconnect_endpoint(endp);
+	else	/* This may reconnect too. */
+		return run_iscsi_event_loop(endp->iscsi, events);
 }
 
 /* Convenience wrapper around iscsi_read10_task(). */
@@ -1667,11 +1709,20 @@ struct scsi_task *read_endpoint(struct endpoint_st const *endp,
 	assert(read_cb != NULL);
 	assert(chunk_size >= endp->blocksize);
 	assert(chunk_size % endp->blocksize == 0);
+
+#ifdef LIBISCSI_API_VERSION
+	return iscsi_read10_task(
+		endp->iscsi, endp->url->lun,
+		block, chunk_size, endp->blocksize,
+		0, 0, 0, 0, 0,
+		read_cb, chunk);
+#else
 	return iscsi_read10_task(
 		endp->iscsi, endp->url->lun,
 		block, chunk_size, endp->blocksize,
 		read_cb, chunk);
-}
+#endif
+} /* read_endpoint */
 
 /* Convenience wrapper around iscsi_write10_task(). */
 struct scsi_task *write_endpoint(struct endpoint_st const *endp,
@@ -1681,13 +1732,23 @@ struct scsi_task *write_endpoint(struct endpoint_st const *endp,
 	assert(write_cb != NULL);
 	assert(sbuf >= endp->blocksize);
 	assert(sbuf % endp->blocksize == 0);
+
+#ifdef LIBISCSI_API_VERSION
+	return iscsi_write10_task(
+		endp->iscsi, endp->url->lun,
+	       	block, (void *)buf, sbuf,
+		endp->blocksize,
+		0, 0, 0, 0, 0,
+		write_cb, chunk);
+#else
 	return iscsi_write10_task(
 		endp->iscsi, endp->url->lun,
 		(void *)buf, sbuf, block,
 		0, 0,
 		endp->blocksize,
 		write_cb, chunk);
-}
+#endif
+} /* write_endpoint */
 
 void destroy_endpoint(struct endpoint_st *endp)
 {
@@ -1706,11 +1767,11 @@ void destroy_endpoint(struct endpoint_st *endp)
 }
 
 /* Print the target's capacity and characteristics. */
-void print_endpoint(char const *which, struct endpoint_st const *endp)
+void print_endpoint(struct endpoint_st const *endp)
 {
 	printf("%s target: nblocks=%u, blocksize=%u, "
 		"granuality=%u, optimum=%u, maximum=%u\n",
-		which, endp->nblocks, endp->blocksize,
+		endp->which, endp->nblocks, endp->blocksize,
 		endp->granuality, endp->optimum, endp->maximum);
 } /* print_endpoint */
 
@@ -1818,8 +1879,7 @@ void calibrate_endpoint(struct endpoint_st *endp,
 } /* calibrate_endpoint */
 
 /* Get the target endpoint's capacity and characteristics. */
-int stat_endpoint(char const *which, struct endpoint_st *endp,
-	unsigned fallback_blocksize)
+int stat_endpoint(struct endpoint_st *endp, unsigned fallback_blocksize)
 {
 	struct scsi_task *task;
 	struct scsi_readcapacity10 *cap;
@@ -1847,7 +1907,9 @@ int stat_endpoint(char const *which, struct endpoint_st *endp,
 			endp->blocksize = 512;
 		if (Opt_verbosity > 0)
 			warn("%s target reported zero blocksize, "
-				"using %u instead", which, endp->blocksize);
+				"using %u instead",
+				endp->which ? endp->which : "iSCSI",
+				endp->blocksize);
 	} else
 		endp->blocksize = cap->block_size;
 	endp->nblocks = cap->lba + 1;
@@ -1881,8 +1943,7 @@ int stat_endpoint(char const *which, struct endpoint_st *endp,
 	return 1;
 }
 
-int init_endpoint(char const *which,
-	struct endpoint_st *endp, char const *url,
+int init_endpoint(struct endpoint_st *endp, char const *url,
 	unsigned fallback_blocksize)
 {
 	/* Create $endp->iscsi and connect to $endp->url. */
@@ -1896,7 +1957,7 @@ int init_endpoint(char const *which,
 		destroy_endpoint(endp);
 		return 0;
 	} else if (!connect_endpoint(endp->iscsi, endp->url)
-		|| !stat_endpoint(which, endp, fallback_blocksize))
+		|| !stat_endpoint(endp, fallback_blocksize))
 	{
 		destroy_endpoint(endp);
 		return 0;
@@ -1910,6 +1971,7 @@ int init_endpoint(char const *which,
 int local_to_remote(struct input_st *input)
 {
 	int eof;
+	ino_t iscsi_dst_ino;
 	struct pollfd pfd[2];
 	struct endpoint_st *src = input->src;
 	struct endpoint_st *dst = input->dst;
@@ -1928,6 +1990,8 @@ int local_to_remote(struct input_st *input)
 	/* Loop until all of $src is written out. */
 	eof = 0;
 	pfd[1].fd = iscsi_get_fd(dst->iscsi);
+	if (!get_inode(pfd[1].fd, &iscsi_dst_ino))
+		iscsi_dst_ino = 0;
 	for (;;)
 	{
 		int ret;
@@ -2025,21 +2089,20 @@ int local_to_remote(struct input_st *input)
 		if (pfd[0].revents & (POLLHUP|POLLRDHUP))
 			eof = 1;
 
-		/* If the connection with $dst works, (re-)send it
-		 * the iSCSI write requests. */
-		if (!is_connection_error(dst->iscsi, "destination",
-			pfd[1].revents))
-		{	/* If it fails, so does the entire operation. */
-			if (!run_iscsi_event_loop(dst->iscsi, pfd[1].revents))
-				return 0;
-			free_surplus_unused_chunks(input);
-		} else
-		{	/* Connection problem, reconnect. */
-			if (!reconnect_endpoint(dst))
-				return 0;
-			reduce_maxreqs("destination", dst);
-			free_surplus_unused_chunks(input);
+		/* Try to (re)send the iSCSI write requests. */
+		if (!run_endpoint(dst, pfd[1].revents))
+		    return 0;
+
+		/* It's possible that run_iscsi_event_loop() did a reconnect
+		 * behind our back.  In this case the inode of the descriptor
+		 * of the target must have changed.  Check this condition. */
+		if (get_inode(pfd[1].fd, &iscsi_dst_ino))
+		{
+			warn("reconnected to destination target");
+			reduce_maxreqs(dst);
 		}
+
+		free_surplus_unused_chunks(input);
 	} /* until $eof is reached and everything is written out */
 
 	/* Close the input file if we opened it. */
@@ -2051,7 +2114,8 @@ int local_to_remote(struct input_st *input)
 /* Download from a remote iSCSI target to a local file. {{{ */
 int remote_to_local(struct input_st *input, unsigned output_flags)
 {
-	struct stat sbuf;
+	struct stat sb;
+	ino_t iscsi_src_ino;
 	struct pollfd pfd[2];
 	struct endpoint_st *src = input->src;
 	struct endpoint_st *dst = input->dst;
@@ -2059,7 +2123,7 @@ int remote_to_local(struct input_st *input, unsigned output_flags)
 	/* Open the output file.  Fail if the file already exists
 	 * and we weren't invoked with -O.  Exceptions are device
 	 * nodes, which won't be considered overwritten. */
-	memset(&sbuf, 0, sizeof(sbuf));
+	memset(&sb, 0, sizeof(sb));
 	output_flags |= O_CREAT | O_WRONLY;
 	if (!dst->fname || !strcmp(dst->fname, "-"))
 	{	/* Output is stdout. */
@@ -2072,8 +2136,8 @@ int remote_to_local(struct input_st *input, unsigned output_flags)
 		if (errno != EEXIST
 			|| ((pfd[1].fd = open(dst->fname,
 				output_flags & ~(O_CREAT|O_EXCL), 0666)) < 0)
-		    	|| fstat(pfd[1].fd, &sbuf) < 0
-			|| !(S_ISCHR(sbuf.st_mode) || S_ISBLK(sbuf.st_mode)))
+		    	|| fstat(pfd[1].fd, &sb) < 0
+			|| !(S_ISCHR(sb.st_mode) || S_ISBLK(sb.st_mode)))
 		{
 			warn_errno(dst->fname);
 			close(pfd[1].fd);
@@ -2088,10 +2152,10 @@ int remote_to_local(struct input_st *input, unsigned output_flags)
 	{	/* For this to work we need to allocate space in advance,
 		 * pwrite() will return ESPIPE.  The exceptions are device
 		 * nodes are exceptions, because they can't be truncated. */
-		if (!sbuf.st_mode)
+		if (!sb.st_mode)
 			/* Haven't fstat()ed $dst. */
-			fstat(pfd[1].fd, &sbuf);
-		if (!(S_ISCHR(sbuf.st_mode) || S_ISBLK(sbuf.st_mode))
+			fstat(pfd[1].fd, &sb);
+		if (!(S_ISCHR(sb.st_mode) || S_ISBLK(sb.st_mode))
 			&& ftruncate(pfd[1].fd,
 				(off_t)src->blocksize * src->nblocks) < 0)
 		{	/* Either fstat() failed or it's not a device node
@@ -2103,6 +2167,8 @@ int remote_to_local(struct input_st *input, unsigned output_flags)
 
 	/* Loop until $input->until is reached. */
 	pfd[0].fd = iscsi_get_fd(src->iscsi);
+	if (!get_inode(pfd[0].fd, &iscsi_src_ino))
+		iscsi_src_ino = 0;
 	for (;;)
 	{
 		int eof, ret;
@@ -2131,23 +2197,21 @@ int remote_to_local(struct input_st *input, unsigned output_flags)
 		} else if (!ret)
 			continue;
 
-		/* If the connection with $src works, (re-)send it
-		 * the iSCSI read requests. */
-		if (!is_connection_error(src->iscsi, "source",
-			pfd[0].revents))
+		/* Try to (re-)send the iSCSI read requests. */
+		if (!run_endpoint(src, pfd[0].revents))
+			return 0;
+
+		/* Did we reconnect? */
+		if (get_inode(pfd[0].fd, &iscsi_src_ino))
 		{
-			if (!run_iscsi_event_loop(src->iscsi, pfd[0].revents))
-				return 0;
-		} else
-		{	/* Connection problem, reconnect. */
-			if (!reconnect_endpoint(src))
-				return 0;
-			reduce_maxreqs("source", src);
+			warn("reconnected to source target");
+			reduce_maxreqs(src);
 			free_surplus_unused_chunks(input);
 		}
 
+		/* Dump $input->output to the local file. */
 		if (pfd[1].revents)
-		{	/* Dump $input->output to the local file. */
+		{
 			process_output_queue(pfd[1].fd, dst, input->output,
 				!eof);
 			free_surplus_unused_chunks(input);
@@ -2167,6 +2231,7 @@ int remote_to_local(struct input_st *input, unsigned output_flags)
 int remote_to_remote(struct input_st *input)
 {
 	struct pollfd pfd[2];
+	ino_t iscsi_src_ino, iscsi_dst_ino;
 	struct endpoint_st *src = input->src;
 	struct endpoint_st *dst = input->dst;
 
@@ -2174,6 +2239,10 @@ int remote_to_remote(struct input_st *input)
 	 * to $dst. */
 	pfd[0].fd = iscsi_get_fd(src->iscsi);
 	pfd[1].fd = iscsi_get_fd(dst->iscsi);
+	if (!get_inode(pfd[0].fd, &iscsi_src_ino))
+		iscsi_src_ino = 0;
+	if (!get_inode(pfd[1].fd, &iscsi_dst_ino))
+		iscsi_dst_ino = 0;
 	for (;;)
 	{
 		int ret;
@@ -2196,34 +2265,26 @@ int remote_to_remote(struct input_st *input)
 		} else if (!ret)
 			continue;
 
-		/* Send $src the read requests. */
-		if (!is_connection_error(src->iscsi, "source",
-			pfd[0].revents))
+		/* Read */
+		if (!run_endpoint(src, pfd[0].revents))
+			return 0;
+		if (get_inode(pfd[0].fd, &iscsi_src_ino))
 		{
-			if (!run_iscsi_event_loop(src->iscsi, pfd[0].revents))
-				return 0;
-		} else
-		{
-			if (!reconnect_endpoint(src))
-				return 0;
-			reduce_maxreqs("source", src);
+			warn("reconnected to source target");
+			reduce_maxreqs(src);
 			free_surplus_unused_chunks(input);
 		}
 
-		/* Send $dst the write requests. */
-		if (!is_connection_error(dst->iscsi, "destination",
-			pfd[1].revents))
+		/* Write */
+		if (!run_endpoint(dst, pfd[1].revents))
+			return 0;
+		if (get_inode(pfd[1].fd, &iscsi_dst_ino))
 		{
-			if (!run_iscsi_event_loop(dst->iscsi, pfd[1].revents))
-				return 0;
-			free_surplus_unused_chunks(input);
-		} else
-		{
-			if (!reconnect_endpoint(dst))
-				return 0;
-			reduce_maxreqs("destination", dst);
-			free_surplus_unused_chunks(input);
+			warn("reconnected to destination target");
+			reduce_maxreqs(dst);
 		}
+
+		free_surplus_unused_chunks(input);
 	} /* until $src->until is reached and everything is written out */
 
 	assert(input->top_block == input->until);
@@ -2266,6 +2327,8 @@ int main(int argc, char *argv[])
 	memset(&src, 0, sizeof(src));
 	memset(&dst, 0, sizeof(dst));
 	memset(&output, 0, sizeof(output));
+	src.endp.which = "source";
+	dst.endp.which = "destination";
 
 	/* Parse the command line */
 	nop = 0;
@@ -2495,8 +2558,7 @@ int main(int argc, char *argv[])
 	if (src.is_local)
 		/* LOCAL_TO_REMOTE() */
 		src.endp.fname = src.fname;
-	else if (!init_endpoint("source", &src.endp, src.url,
-			src.fallback_blocksize))
+	else if (!init_endpoint(&src.endp, src.url, src.fallback_blocksize))
 		die(NULL);
 	else if (dst.is_local)
 		calibrate_endpoint(&src.endp, src.desired_optimum);
@@ -2518,8 +2580,7 @@ int main(int argc, char *argv[])
 		output.max = Opt_max_output_queue;
 		output.iov = xmalloc(sizeof(*output.iov) * output.max);
 		output.tasks = xmalloc(sizeof(*output.tasks) * output.max);
-	} else if (!init_endpoint("destination", &dst.endp, dst.url,
-			dst.fallback_blocksize))
+	} else if (!init_endpoint(&dst.endp, dst.url, dst.fallback_blocksize))
 		die(NULL);
 	else if (src.is_local)
 		calibrate_endpoint(&dst.endp, dst.desired_optimum);
@@ -2619,9 +2680,9 @@ int main(int argc, char *argv[])
 	if (nop)
 	{	/* Just print the capacity of the targets. */
 		if (!src.is_local)
-			print_endpoint("source", &src.endp);
+			print_endpoint(&src.endp);
 		if (!dst.is_local)
-			print_endpoint("destination", &dst.endp);
+			print_endpoint(&dst.endp);
 		isok = 1;
 	} else if (LOCAL_TO_REMOTE(&input))
 		isok = local_to_remote(&input);

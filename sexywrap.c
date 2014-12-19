@@ -390,7 +390,7 @@ int read_blocks(struct input_st *input, callback_t read_cb)
 		{	/* Connection problem with $src, reconnect. */
 			if (!reconnect_endpoint(src))
 				goto eio;
-			reduce_maxreqs(NULL, src);
+			reduce_maxreqs(src);
 			free_surplus_unused_chunks(input);
 		}
 	} /* until $input->until is reached */
@@ -510,7 +510,7 @@ int write_blocks(struct input_st *input, scsi_block_addr_t from,
 		{
 			if (!reconnect_endpoint(dst))
 				return 0;
-			reduce_maxreqs(NULL, dst);
+			reduce_maxreqs(dst);
 			free_surplus_unused_chunks(input);
 		}
 	} /* until !$sbuf */
@@ -622,8 +622,7 @@ int open(char const *fname, int flags, ...)
 	}
 
 	/* Connect to the target iSCSI. */
-	if (!connect_endpoint(iscsi, url)
-		|| !stat_endpoint("iSCSI", &target->endp, 0))
+	if (!connect_endpoint(iscsi, url) || !stat_endpoint(&target->endp, 0))
 	{	/* Return some generic error.  The called functions have
 		 * already logged the real reason. */
 		cleanup_target(target);
@@ -896,7 +895,12 @@ ssize_t read(int fd, void *buf, size_t sbuf)
 
 		assert(task != NULL);
 		assert(chunk != NULL);
+
+#ifdef LIBISCSI_API_VERSION
+		task->ptr = scsi_cdb_unmarshall(task, SCSI_OPCODE_READ10);
+#endif
 		assert(LBA_OF(task) == chunk->address);
+
 		assert(chunk->address >= first);
 		assert(chunk->address < input.until);
 
@@ -1025,7 +1029,12 @@ ssize_t write(int fd, void const *buf, size_t sbuf)
 
 		assert(task != NULL);
 		assert(chunk != NULL);
+
+#ifdef LIBISCSI_API_VERSION
+		task->ptr = scsi_cdb_unmarshall(task, SCSI_OPCODE_READ10);
+#endif
 		assert(LBA_OF(task) == chunk->address);
+
 		assert(chunk->address >= from);
 		assert(chunk->address < input.until);
 
