@@ -1031,9 +1031,22 @@ int process_output_queue(int fd,
 	 * We'd be fine without gotos, they're only used to skip conditions
 	 * known to be false. */
 	assert(output->max > 0);
-	goto middle;
 	for (;;)
 	{
+		/* Add a new (possibly the first) buffer to the batch. */
+		if (fd >= 0)
+			add_to_output_iov(output, tasks[0], niov);
+		niov++;
+
+		/* Move $block forward by the number of blocks
+		 * carried by $tasks[0]. */
+		assert(tasks[0]->datain.size % dst->blocksize == 0);
+		block += tasks[0]->datain.size / dst->blocksize;
+
+		tasks++;
+		ntasks--;
+
+		/* Do we have enough buffers in the batch or continue? */
 		if (niov >= output->max)
 		{	/* $output->iov has reached its maximal capacity,
 			 * we need to flush it.  Fall through. */
@@ -1049,17 +1062,6 @@ int process_output_queue(int fd,
 			assert(0);
 		} else if (LBA_OF(tasks[0]) == block)
 		{	/* Found the next buffer in $output->tasks. */
-middle:			if (fd >= 0)
-				add_to_output_iov(output, tasks[0], niov);
-			niov++;
-
-			/* Move $block forward by the number of blocks
-			 * carried by $tasks[0]. */
-			assert(tasks[0]->datain.size % dst->blocksize == 0);
-			block += tasks[0]->datain.size / dst->blocksize;
-
-			tasks++;
-			ntasks--;
 			continue;
 		} else if (niov >= Opt_min_output_batch)
 		{	/* The current batch has finished and there's
@@ -1072,16 +1074,13 @@ middle:			if (fd >= 0)
 			from = tasks;
 			tasks++;
 			ntasks--;
+			niov = 0;
 
 			/* $from is the first chunk of the batch,
 			 * move $block forward. */
 			assert(from[0]->datain.size % dst->blocksize == 0);
 			block = LBA_OF(from[0])
 				+ from[0]->datain.size / dst->blocksize;
-
-			if (fd >= 0)
-				add_to_output_iov(output, from[0], 0);
-			niov = 1;
 
 			/* Since there's a gap between the previous and this
 			 * new batch we need to seek to $first when flushing
@@ -1128,7 +1127,6 @@ middle:			if (fd >= 0)
 		/* Keep $need_to_seek, because pwrite*() doesn't change
 		 * the file offset. */
 		niov = 0;
-		goto middle;
 	} /* until all batches are output or skipped */
 
 	return 0;
@@ -2105,6 +2103,9 @@ int local_to_remote(struct input_st *input)
 		free_surplus_unused_chunks(input);
 	} /* until $eof is reached and everything is written out */
 
+	if (Opt_verbosity > 0)
+		info("written %u blocks", input->until);
+
 	/* Close the input file if we opened it. */
 	if (src->fname)
 		close(pfd[0].fd);
@@ -2219,6 +2220,8 @@ int remote_to_local(struct input_st *input, unsigned output_flags)
 	} /* until $eof is reached and everything is written out */
 
 	assert(input->top_block == input->until);
+	if (Opt_verbosity > 0)
+		info("read %u blocks", input->until);
 
 	/* Close the input file if we opened it. */
 	if (dst->fname)
@@ -2288,6 +2291,9 @@ int remote_to_remote(struct input_st *input)
 	} /* until $src->until is reached and everything is written out */
 
 	assert(input->top_block == input->until);
+	if (Opt_verbosity > 0)
+		info("transferred %u blocks", input->until);
+
 	return 1;
 } /* remote_to_remote }}} */
 
