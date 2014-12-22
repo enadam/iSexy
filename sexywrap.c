@@ -266,11 +266,11 @@ int cleanup_target(struct target_st *target)
  * Initialize $input with $output and $endp, verify that at least part
  * of the requested region [$position..$position+*$sbufp[ is within the
  * limits of $endp, and figure out the corresponding block numbers (RoI)
- * [$input->top_block..$input->until] which covers the requested region.
+ * [$input->top_block..$input->until[ which covers the requested region.
  *
  * If *$sbufp == 0 or $position is off the limits of $endp, *$sbufp is
  * set to/left 0 and 0 is returned.  Otherwise *$sbufp is reduced to > 0
- * as necessary.  On error 0 is returned and $errno is set.  Otherwise
+ * as necessary.  On error false is returned and $errno is set.  Otherwise
  * true is returned.
  */
 int get_roi(struct input_st *input, struct output_st *output,
@@ -348,19 +348,21 @@ int get_roi(struct input_st *input, struct output_st *output,
 /*
  * This function drives libiscsi for our read() override.  Essentially
  * it does the same as remote_to_local() in sexycat.c.  Reads $input->src
- * until $input->until is reached, and calls $read_cb() for all received
- * chunks.  Returns whether everything has gone well, and sets $errno if
- * necessary.
+ * $input->until is reached, and calls $read_cb() for all received chunks.
+ * Returns whether everything has gone well, and sets $errno if necessary.
  */
 int read_blocks(struct input_st *input, callback_t read_cb)
 {
 	struct pollfd pfd;
+	ino_t iscsi_src_ino;
 	struct endpoint_st *src = input->src;
 
 	/* Loop until we're out of read requests. */
 	assert(!input->failed);
 	assert(input->unused && input->nunused);
 	pfd.fd = iscsi_get_fd(src->iscsi);
+	iscsi_src_ino = 0;
+	get_inode(pfd.fd, &iscsi_src_ino);
 	for (;;)
 	{
 		int ret;
@@ -382,14 +384,11 @@ int read_blocks(struct input_st *input, callback_t read_cb)
 			continue;
 
 		/* (Re)send the iSCSI read requests. */
-		if (!is_connection_error(src->iscsi, NULL, pfd.revents))
+		if (!run_endpoint(src, pfd.revents))
+			goto eio;
+		if (get_inode(pfd.fd, &iscsi_src_ino))
 		{
-			if (!run_iscsi_event_loop(src->iscsi, pfd.revents))
-				goto eio;
-		} else
-		{	/* Connection problem with $src, reconnect. */
-			if (!reconnect_endpoint(src))
-				goto eio;
+			warn("reconnected to destination target");
 			reduce_maxreqs(src);
 			free_surplus_unused_chunks(input);
 		}
@@ -789,7 +788,7 @@ int __fxstat(int version, int fd, struct stat *sbuf)
 	sbuf->st_rdev = MKDEV(SCSI_DISK7_MAJOR, 0);
 
 	/*
-	 * Nevertheless is sounds like a good idea to report the size
+	 * Nevertheless it sounds like a good idea to report the size
 	 * of the target disk.  Note that st_blocks is not ->nblocks,
 	 * but the number of 512-byte blocks.  Since ->blocksize is
 	 * assumed to be a multiply of 512, we can divide it.
@@ -927,7 +926,7 @@ ssize_t read(int fd, void *buf, size_t sbuf)
 			 *  first     first+1 (=: address)
 			 * /     blocksize   \/task->datain.data\
 			 * |--------v---------|======v===========|
-			 * |        |offset1/2|  n   |      first+2
+			 * |        |offset1&2|  n   |      first+2
 			 * v      ./+----------------+
 			 * offset0  |      sbuf      |
 			 *       position

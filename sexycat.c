@@ -186,7 +186,7 @@
 /* Shortcuts */
 #ifdef LIBISCSI_API_VERSION
 # define LBA_OF(task)			(((struct scsi_read10_cdb const *)((task)->ptr))->lba)
-#else
+#else /* libiscsi 1.4 */
 # define LBA_OF(task)			((task)->params.read10.lba)
 #endif
 
@@ -658,23 +658,29 @@ void die(char const *fmt, ...)
 }
 
 /*
- * Return the i-node number of $fd.  If it's different from *$inodep,
- * returns 1, otherwise (also in case of error) returns 0.  Used to
- * find out whether libiscsi reconnected to the target in its event loop.
+ * Return the i-node number of $fd.  If *$inodep != 0 and it differs from
+ * the current value, *$inodep is updated and 1 is returned.   Otherwise
+ * (also in case of error) returns 0.  If !*$inodep, the retrieved number
+ * is saved.  Used to find out whether libiscsi reconnected to the target
+ * in its event loop.
  */
 int get_inode(int fd, ino_t *inodep)
 {
 	struct stat sb;
 
 	if (fstat(fd, &sb) < 0)
-	{
+	{	/* Couldn't get the i-node number. */
 		warn_errno("fstat");
 		return 0;
+	} else if (*inodep == 0)
+	{	/* This is probably the first time we query it. */
+		*inodep = sb.st_ino;
+		return 0;
 	} else if (*inodep != sb.st_ino)
-	{
+	{	/* The previous and the current numbers differ. */
 		*inodep = sb.st_ino;
 		return 1;
-	} else
+	} else	/* The i-node number hasn't changed. */
 		return 0;
 } /* get_inode */
 
@@ -1188,7 +1194,9 @@ void chunk_read(struct iscsi_context *iscsi, int status,
 	assert(task != NULL);
 
 #ifdef LIBISCSI_API_VERSION
-	/* This will be freed by scsi_free_scsi_task(). */
+	/* libiscsi won't need this pointer anymore, so we can use it
+	 * to store the task's scsi_read10_cdb.  This will be freed by
+	 * scsi_free_scsi_task() automagically. */
 	task->ptr = scsi_cdb_unmarshall(task, SCSI_OPCODE_READ10);
 #endif
 	assert(LBA_OF(task) == chunk->address);
@@ -1714,7 +1722,7 @@ struct scsi_task *read_endpoint(struct endpoint_st const *endp,
 		block, chunk_size, endp->blocksize,
 		0, 0, 0, 0, 0,
 		read_cb, chunk);
-#else
+#else	/* old libiscsi */
 	return iscsi_read10_task(
 		endp->iscsi, endp->url->lun,
 		block, chunk_size, endp->blocksize,
@@ -1738,7 +1746,7 @@ struct scsi_task *write_endpoint(struct endpoint_st const *endp,
 		endp->blocksize,
 		0, 0, 0, 0, 0,
 		write_cb, chunk);
-#else
+#else	/* old libiscsi */
 	return iscsi_write10_task(
 		endp->iscsi, endp->url->lun,
 		(void *)buf, sbuf, block,
@@ -1987,9 +1995,9 @@ int local_to_remote(struct input_st *input)
 
 	/* Loop until all of $src is written out. */
 	eof = 0;
+	iscsi_dst_ino = 0;
 	pfd[1].fd = iscsi_get_fd(dst->iscsi);
-	if (!get_inode(pfd[1].fd, &iscsi_dst_ino))
-		iscsi_dst_ino = 0;
+	get_inode(pfd[1].fd, &iscsi_dst_ino);
 	for (;;)
 	{
 		int ret;
@@ -2167,9 +2175,9 @@ int remote_to_local(struct input_st *input, unsigned output_flags)
 	} /* $dst->seekable */
 
 	/* Loop until $input->until is reached. */
+	iscsi_src_ino = 0;
 	pfd[0].fd = iscsi_get_fd(src->iscsi);
-	if (!get_inode(pfd[0].fd, &iscsi_src_ino))
-		iscsi_src_ino = 0;
+	get_inode(pfd[0].fd, &iscsi_src_ino);
 	for (;;)
 	{
 		int eof, ret;
@@ -2242,10 +2250,9 @@ int remote_to_remote(struct input_st *input)
 	 * to $dst. */
 	pfd[0].fd = iscsi_get_fd(src->iscsi);
 	pfd[1].fd = iscsi_get_fd(dst->iscsi);
-	if (!get_inode(pfd[0].fd, &iscsi_src_ino))
-		iscsi_src_ino = 0;
-	if (!get_inode(pfd[1].fd, &iscsi_dst_ino))
-		iscsi_dst_ino = 0;
+	iscsi_src_ino = iscsi_dst_ino = 0;
+	get_inode(pfd[0].fd, &iscsi_src_ino);
+	get_inode(pfd[1].fd, &iscsi_dst_ino);
 	for (;;)
 	{
 		int ret;
