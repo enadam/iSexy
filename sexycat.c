@@ -1254,7 +1254,7 @@ void chunk_read(struct iscsi_context *iscsi, int status,
 		chunk->input->output->nreqs++;
 }
 
-/* Return the optimal number of bytes to read/write [$from..$until] blocks
+/* Return the optimal number of bytes to read/write [$from..$until[ blocks
  * taking the target's optimal transfer size and granuality into account. */
 size_t read_chunk_size(
 	struct endpoint_st const *src, struct endpoint_st const *dst,
@@ -1292,8 +1292,8 @@ size_t read_chunk_size(
 	} else
 	{	/* We have a single $endp:oint to consider. */
 		/* If $from is not at $optimum boundary, progress until
-		 * that point.* Otherwise read/write $optimum number of
-		 * blocks. */
+		 * that point. Otherwise read/write the $optimum number
+		 * of blocks. */
 		nblocks = from % endp->optimum;
 		nblocks = nblocks > 0
 			? endp->optimum - nblocks
