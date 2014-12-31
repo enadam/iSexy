@@ -75,6 +75,15 @@ extern ssize_t __write(int fd, void const *buf, size_t sbuf);
 #include <linux/kdev_t.h>
 /* }}} */
 
+/*
+ * When write(2)ing, this is the maximum number of blocks we'll request for
+ * but won't read, because it's entirely overwritten.  If enabled 2 reads
+ * and 3 writes can be reduced to 1/1 in some cases. Of course this is a
+ * memory and network traffic overhead (because these dead blocks need to
+ * be transmitted and stored).
+ */
+#define DEAD_READ			1
+
 /* Private functions {{{ */
 /* Creating/finding/returning targets. */
 static struct target_st *is_target_unused(struct target_st *target);
@@ -370,9 +379,9 @@ int read_blocks(struct input_st *input, callback_t read_cb)
 		/* (Re)create the iSCSI read requests and return
 		 * if none needed. */
 		if (!restart_requests(input, read_cb, NULL))
-			goto enomem;
+			break;
 		if (!start_iscsi_read_requests(input, read_cb))
-			goto enomem;
+			break;
 		if (!input->nreqs && !input->failed)
 			return 1;
 
@@ -385,36 +394,34 @@ int read_blocks(struct input_st *input, callback_t read_cb)
 
 		/* (Re)send the iSCSI read requests. */
 		if (!run_endpoint(src, pfd.revents))
-			goto eio;
-		if (get_inode(pfd.fd, &iscsi_src_ino))
 		{
-			warn("reconnected to destination target");
+			errno = EIO;
+			return 0;
+		} else if (get_inode(pfd.fd, &iscsi_src_ino))
+		{
 			reduce_maxreqs(src);
 			free_surplus_unused_chunks(input);
 		}
 	} /* until $input->until is reached */
 
 	/* We ran into an error. */
-enomem:	errno = ENOMEM;
-	return 0;
-eio:	errno = EIO;
+	errno = ENOMEM;
 	return 0;
 } /* read_blocks */
 
 /*
  * Write $buf to $input->dst starting $from block.  $buf is expected
- * to be on block-boundary, and $min...$max bytes of it will be written,
- * so it must be >= $max bytes large.
- *
- * At the moment $max is unused, but later we might choose to write larger
- * chunks than the target device's block size if it indicated support for
- * larger transfer sizes.
+ * to be on block-boundary, and an undefined number of bytes between
+ * $min and $max will be written.  The limits aren't required to be
+ * a multiple of $input->dst's block size.
  */
 int write_blocks(struct input_st *input, scsi_block_addr_t from,
 	void const *buf, size_t min, size_t max)
 {
 	size_t sbuf;
 	struct pollfd pfd;
+	ino_t iscsi_dst_ino;
+	scsi_block_addr_t until;
 	struct endpoint_st *dst = input->dst;
 
 	assert(!input->failed);
@@ -428,8 +435,16 @@ int write_blocks(struct input_st *input, scsi_block_addr_t from,
 	assert(sbuf <= max);
 	assert(sbuf % dst->blocksize == 0);
 
+	/* $max := round_down($max, $blocksize) */
+	max -= max % dst->blocksize;
+	if (max < sbuf)
+		max = sbuf;
+	until = from + max / dst->blocksize;
+
 	/* Loop until $sbuf is entirely consumed. */
 	pfd.fd = iscsi_get_fd(dst->iscsi);
+	iscsi_dst_ino = 0;
+	get_inode(pfd.fd, &iscsi_dst_ino);
 	for (;;)
 	{
 		int ret;
@@ -466,7 +481,7 @@ int write_blocks(struct input_st *input, scsi_block_addr_t from,
 		/* Recreate failed iSCSI requests.
 		 * Return if the job is done. */
 		if (!restart_requests(input, NULL, write_cb))
-			goto enomem;
+			break;
 		if (!sbuf && !input->output->nreqs && !input->failed)
 			return 1;
 
@@ -479,17 +494,19 @@ int write_blocks(struct input_st *input, scsi_block_addr_t from,
 			chunk = input->unused;
 			take_chunk(chunk);
 
-			assert(sbuf >= dst->blocksize);
-			chunk->sbuf = dst->blocksize;
+			chunk->sbuf = read_chunk_size(NULL, dst, from, until);
 			chunk->u.wbuf = buf;
 			if (!write_endpoint(dst, from,
 					chunk->u.wbuf, chunk->sbuf,
 					write_cb, chunk))
-				goto enomem;
+				break;
 			input->output->nreqs++;
 
 			buf  += chunk->sbuf;
-			sbuf -= chunk->sbuf;
+			if (sbuf > chunk->sbuf)
+				sbuf -= chunk->sbuf;
+			else	/* $sbuf < we wrote <= $max */
+				sbuf = 0;
 			from += chunk->sbuf / dst->blocksize;
 		} /* request write */
 
@@ -500,21 +517,17 @@ int write_blocks(struct input_st *input, scsi_block_addr_t from,
 		else if (!ret)
 			continue;
 
-		if (!is_connection_error(dst->iscsi, NULL, pfd.revents))
-		{	/* (Re)send the iSCSI write requests. */
-			if (!run_iscsi_event_loop(dst->iscsi, pfd.revents))
-				return 0;
-			free_surplus_unused_chunks(input);
-		} else
+		/* (Re)send the iSCSI write requests. */
+		if (!run_endpoint(dst, pfd.revents))
 		{
-			if (!reconnect_endpoint(dst))
-				return 0;
+			errno = EIO;
+			return 0;
+		} else if (get_inode(pfd.fd, &iscsi_dst_ino))
 			reduce_maxreqs(dst);
-			free_surplus_unused_chunks(input);
-		}
+		free_surplus_unused_chunks(input);
 	} /* until !$sbuf */
 
-enomem:	errno = ENOMEM;
+	errno = ENOMEM;
 	return 0;
 } /* write_blocks */
 /* libiscsi middleware }}} */
@@ -987,7 +1000,7 @@ ssize_t write(int fd, void const *buf, size_t sbuf)
 	scsi_block_addr_t from;
 	scsi_block_count_t nblocks;
 	unsigned blocksize, offset;
-	struct scsi_task *first, *second, *last;
+	struct scsi_task *first, *last;
 	size_t n;
 	off_t cnt;
 
@@ -1016,7 +1029,7 @@ ssize_t write(int fd, void const *buf, size_t sbuf)
 	from = input.top_block;
 	nblocks = input.until - from;
 	blocksize = target->endp.blocksize;
-	first = second = last = NULL;
+	first = last = NULL;
 
 	/* Called when a chunk of data is read.  Store them in $first,
 	 * $second or $last as appropriate, depending on their block no. */
@@ -1030,12 +1043,15 @@ ssize_t write(int fd, void const *buf, size_t sbuf)
 		assert(chunk != NULL);
 
 #ifdef LIBISCSI_API_VERSION
+		/* See chunk_read() in sexycat.c. */
 		task->ptr = scsi_cdb_unmarshall(task, SCSI_OPCODE_READ10);
 #endif
-		assert(LBA_OF(task) == chunk->address);
 
+		assert(chunk->address == LBA_OF(task));
 		assert(chunk->address >= from);
 		assert(chunk->address < input.until);
+		assert(task->datain.size > 0);
+		assert(task->datain.size % blocksize == 0);
 
 		assert(chunk->input->nreqs > 0);
 		chunk->input->nreqs--;
@@ -1047,34 +1063,29 @@ ssize_t write(int fd, void const *buf, size_t sbuf)
 			return;
 		}
 
-		/* Determine which block has been read.  When checking
-		 * the LBAs take care not to commit integer overflow. */
+		/* Is it the $first or $last chunk? */
 		if (chunk->address == from)
-		{
+		{	/* We'll write the head and possibly
+			 * the tail of $buf to $first. */
 			assert(!first);
 			first = task;
-		} else if (chunk->address - from == 1)
-		{
-			assert(!second);
-			second = task;
-		} else
-		{
-			assert(input.until - chunk->address == 1);
+		} else if (input.until - chunk->address
+			<= task->datain.size / blocksize)
+		{	/* $address + $nblocks >= $until.
+			 * We'll write the tail of $buf to $last. */
 			assert(!last);
 			last = task;
-		}
+		} else	/* Not interested in this chunk. */
+			scsi_free_scsi_task(task);
 
 		return_chunk(chunk);
 	} /* read_cb */
 
-	/* Deallocate $first, $second, $last and $input,
-	 * and set $errno if necessary. */
+	/* Deallocate $first, $last and $input, and set $errno as needed. */
 	int clean_up(int new_errno)
 	{
 		if (first)
 			scsi_free_scsi_task(first);
-		if (second)
-			scsi_free_scsi_task(second);
 		if (last)
 			scsi_free_scsi_task(last);
 		done_input(&input);
@@ -1087,12 +1098,29 @@ ssize_t write(int fd, void const *buf, size_t sbuf)
 	} /* clean_up */
 
 	/*
-	 * We have the following cases regarding $target->position, {{{
-	 * $sbuf and block boundaries:
+	 * These are the possible cases regarding $target->position, {{{
+	 * $sbuf and block boundaries.  Since we can only read/write
+	 * in blocks, our strategy is to read the $first and $last blocks,
+	 * modify their contents and write them back.  If there's a gap
+	 * in between (blocks to overwrite completely) we just write them
+	 * out ("bulk copy").  This is best illustrated by case 4.
+	 *
+	 * Not all the cases require $first and/or $last, as indicated below.
+	 * Furthermore in some cases we [can] optimize by loading the entire
+	 * range of interest (RoI) into $first, overwriting the appropriate
+	 * part of it with $buf and writing it back.  back.  This can reduce
+	 * the number of read/write operations, which can be more expensive
+	 * than transferring some untouched data back and forth.
+	 *
+	 * What can complicate things is that once we request more than one
+	 * block we may get more than one chunks in return.  So for example
+	 * in case 4, even if we requested to read 3 blocks we might get two
+	 * chunks: one for the first block and another for the remaining two.
+	 * We need to handle this situation.
 	 *
 	 * /////////////////////////// CASE 1 //////////////////////////////
 	 *
-	 *         position       sbuf
+	 *         offset         sbuf
 	 * -----|-----|=============|-------------------|
 	 *    block               block               block
 	 *
@@ -1100,11 +1128,11 @@ ssize_t write(int fd, void const *buf, size_t sbuf)
 	 * $offset > 0 (head is unaligned)
 	 * $sbuf < $blocksize
 	 * $offset + $sbuf == $blocksize
-	 * $first is used (request 1 block), $second and $last are unset
+	 * $first is used (1 block), $last is unset
 	 *
 	 * /////////////////////////// CASE 2 //////////////////////////////
 	 *
-	 *   position       sbuf
+	 *   offset         sbuf
 	 * -----|=============|-----|-------------------|
 	 *    block               block               block
 	 *
@@ -1112,11 +1140,11 @@ ssize_t write(int fd, void const *buf, size_t sbuf)
 	 * $offset == 0 (head is aligned)
 	 * $sbuf < $blocksize, $offset + $sbuf < $blocksize
 	 * $offset + $sbuf < $blocksize
-	 * $first is used (request 1 block), $second and $last are unset
+	 * $first is used (1 block), $last is unset
 	 *
 	 * /////////////////////////// CASE 3 //////////////////////////////
 	 *
-	 *         position              sbuf
+	 *         offset                sbuf
 	 * -----|-----|=============|======|------------|
 	 *    block               block               block
 	 *
@@ -1126,49 +1154,48 @@ ssize_t write(int fd, void const *buf, size_t sbuf)
 	 * $blocksize < $offset + $sbuf < $blocksize*2
 	 * ($sbuf - ($blocksize-$offset)) % $blocksize > 0 (tail is unaligned)
 	 * $first is used (request 2 blocks),
-	 * $second is used if sizeof($first) < $blocksize*2,
-	 * $last is unset
+	 * $last is used if sizeof($first) < $nblocks
 	 *
 	 * /////////////////////////// CASE 4 //////////////////////////////
 	 *
-	 *         position                           sbuf
-	 * -----|-----|=============|===================|
-	 *    block               block               block
-	 *
-	 * $nblocks == 2
-	 * $offset > 0 (head is unaligned)
-	 * $blocksize < $sbuf < $blocksize*2
-	 * $offset + $sbuf == $blocksize*2
-	 * ($sbuf - ($blocksize-$offset)) % $blocksize == 0 (tail is aligned)
-	 * $first is used (request 1 block), $second and last are unset
-	 * if sizeof($first) < $blocksize*2, bulk copy is used
-	 * possible optimization: request $blocksize*2 for the $first chunk
-	 * (at the moment $n blocks == $n requests)
-	 *
-	 * /////////////////////////// CASE 5 //////////////////////////////
-	 *
-	 *         position                                         sbuf
+	 *         offset                                           sbuf
 	 * -----|-----|=============|===================|=============|-----|
 	 *    block               block               block               block
 	 *
 	 * $nblocks > 2
 	 * $offset > 0 (head is unaligned)
 	 * $sbuf > $blocksize
-	 * $blocksize*2 < $offset + $sbuf < $blocksize*3
+	 * $blocksize*2 < $offset + $sbuf
 	 * ($sbuf - ($blocksize-$offset)) % $blocksize > 0 (tail is unaligned)
 	 *   <=> ($offset + $sbuf) % $blocksize > 0
-	 * $first is used (request 1 block), $second is unset, bulk copy is
-	 * used, $last is used
-	 * possible optimization: if $sbuf is not too large, read and write
-	 * all the blocks with the $first chunk
+	 * $first is used (request $nblocks if 1+DEAD_READ+1 >= $nblocks,
+	 *   otherwise request 1 block),
+	 * $last is used if sizeof($first) < $nblocks
+	 * bulk copy is used if sizeof($first) < $nblocks-1
+	 *
+	 * /////////////////////////// CASE 5 //////////////////////////////
+	 *
+	 *         offset                             sbuf
+	 * -----|-----|=============|===================|
+	 *    block               block               block
+	 *
+	 * $nblocks > 1
+	 * $offset > 0 (head is unaligned)
+	 * $blocksize < $sbuf
+	 * $offset + $sbuf >= $blocksize*2
+	 * ($sbuf - ($blocksize-$offset)) % $blocksize == 0 (tail is aligned)
+	 * $first is used (request $nblocks if 1+DEAD_READ >= $nblocks,
+	 *   otherwise request 1 block)
+	 * $last can be set, but isn't used
+	 * bulk copy is used if sizeof($first) < $nblocks
 	 *
 	 * /////////////////////////// CASES 6-7 ///////////////////////////
 	 *
-	 *   position                    sbuf
+	 *   offset                      sbuf
 	 * -----|===================|======|------------|
 	 *    block               block               block
 	 *
-	 *   position                                               sbuf
+	 *   offset                                                 sbuf
 	 * -----|===================|===================|=============|-----|
 	 *    block               block               block               block
 	 *
@@ -1177,87 +1204,107 @@ ssize_t write(int fd, void const *buf, size_t sbuf)
 	 * $sbuf > $blocksize
 	 * ($sbuf - ($blocksize-$offset)) % $blocksize > 0 (tail is unaligned)
 	 *   <=> $sbuf % $blocksize > 0 <=> ($offset + $sbuf) % $blocksize > 0
-	 * $first and second are unset, bulk copy is used, $last is used
+	 * $first is unset, bulk copy is used, $last is used
 	 * possible optimization: like above
 	 *
 	 * /////////////////////////// CASES 8-9 ///////////////////////////
 	 *
-	 *   position             sbuf
+	 *   offset               sbuf
 	 * -----|===================|-------------------|
 	 *    block               block               block
 	 *
-	 *   position                                 sbuf
+	 *   offset                                   sbuf
 	 * -----|===================|===================|
 	 *    block               block               block
 	 *
-	 * $nblocks can be anything
+	 * $nblocks >= 1
 	 * $offset == 0 (head is aligned)
 	 * $sbuf >= $blocksize
 	 * ($sbuf - ($blocksize-$offset)) % $blocksize == 0 (tail is aligned)
 	 *   <=> $sbuf % $blocksize == 0 <=> ($offset+$sbuf) % $blocksize == 0
-	 * $first, $second and $last are unset, bulk copy is used
+	 * $first and $last are unset, bulk copy is used
 	 * }}}
 	 */
 
-	/* Get $first and possibly $second for cases 1-5. */
+	/* Get $first and/or $last for cases 1-7. */
 	assert(nblocks > 0);
 	offset = target->position % blocksize;
-	if (offset > 0 || sbuf < blocksize)
-	{	/* Write < than a block or the head of $buf is unaligned. */
-		if (offset + sbuf >= blocksize*2)
-			/* Cases 4-5: adjust $input.until to request a single
-			 * block for $first; for cases 1-3 $input.until is
-			 * already correct (one or two blocks). */
-			input.until = from + 1;
-		if (!read_blocks(&input, read_cb))
-			return clean_up(errno);
-
-		/* Verify that we have usable $first and $second. */
-		assert(first && !last);
-		if (first->datain.size < blocksize)
-			return clean_up(EIO);
-		else if (blocksize < offset + sbuf
-			&& offset + sbuf < blocksize*2
-			&& first->datain.size < blocksize*2)
-		{	/* Case 3 && sizeof($first) < 2 blocks */
-			assert(second);
-			if (second->datain.size < blocksize)
-				return clean_up(EIO);
-		} else	/* All other cases. */
-			assert(!second);
-	} /* get $first and $second */
-
-	/* Get $last for cases 5-7. */
-	if ((nblocks > 2 || (nblocks == 2 && !offset))
-		&& (offset + sbuf) % blocksize > 0)
-	{	/* We'll need to write back a partial $last block. */
-		input.until = from + nblocks;
-		input.top_block = input.until - 1;
-		if (!read_blocks(&input, read_cb))
-			return clean_up(errno);
-
-		if (nblocks == 2)
-		{	/* read_cb() must have mistaken $second for $last. */
-			assert(second && !last);
-			last = second;
-			second = NULL;
+	if (offset > 0 || sbuf % blocksize)
+	{
+		/*
+		 * We can optimize by reading the entire RoI into $first in
+		 * case 4:   if 1+DEAD_READ+1 >= $nblocks
+		 * case 5:   if 1+DEAD_READ >= $nblocks
+		 * case 6/7: if DEAD_READ+1 >= $nblocks
+		 * Otherwise (that is, if the conditions below ARE met)
+		 * just read a single block to $first/$last.
+		 */
+		if (!offset)
+		{	/* Cases 2/6/7 */
+			if (nblocks > DEAD_READ + 1)
+				/* Load the $last block (not in case 2). */
+				input.top_block = input.until - 1;
+		} else if ((offset + sbuf) % blocksize == 0)
+		{	/* Case 1/5 */
+			if (nblocks > 1 + DEAD_READ)
+				/* Load only the $first block (!case 1). */
+				input.until = from + 1;
 		} else
-			assert(last != NULL);
+		{	/* Case 3/4 */
+			if (nblocks > 1 + DEAD_READ + 1)
+				/* Likewise (not in case 3) */
+				input.until = from + 1;
+		} /* for each case 1-7 */
 
-		if (last->datain.size < blocksize)
-			return clean_up(EIO);
-	} /* get $last */
+		if (!read_blocks(&input, read_cb))
+			return clean_up(errno);
+
+		/* Verify that we have've got $first and/or $last. */
+		if (offset + sbuf <= blocksize)
+		{	/* Cases 1-2 */
+			assert(first && !last);
+		} else if (offset > 0 && (offset + sbuf) % blocksize)
+		{	/* Cases 3-4 */
+			assert(first);
+			if (first->datain.size < nblocks*blocksize && !last)
+			{	/* We need the $last block. */
+				input.top_block = from + nblocks - 1;
+				input.until = input.top_block + 1;
+				if (!read_blocks(&input, read_cb))
+					return clean_up(errno);
+				assert(last);
+			}
+		} else if (offset > 0)
+		{	/* Case 5 */
+			assert(first);
+			if (last)
+			{	/* Use bulk copy instead of
+				 * writing back $last. */
+				scsi_free_scsi_task(last);
+				last = NULL;
+			}
+		} else
+		{	/* Cases 6-7 */
+			assert(!offset && sbuf % blocksize && nblocks > 1);
+			if (first && first->datain.size < nblocks * blocksize)
+			{	/* Similarly, use bulk copy rather than
+				 * writing back $first.*/
+				assert(last);
+				scsi_free_scsi_task(first);
+				first = NULL;
+			} else if (!first)
+				assert(last);
+		} /* for each case 1-7 */
+	} /* get $first and $last */
 
 	/* Done with reading. */
 	input.src = NULL;
 	input.dst = &target->endp;
 
-	/* Start writing.  $cnt := the number of byte written. */
+	/* Write $first back.  $cnt := the number of bytes written. */
 	cnt = 0;
-	if (offset > 0 || sbuf < blocksize)
-	{	/* Cases 1-5: write back the $first chunk. */
-		assert(first != NULL);
-
+	if (first)
+	{
 		/* We must not use $first above its last block boundary,
 		 * because we couldn't write it back.  Of course such a
 		 * chunk shouldn't have been returned in the first place. */
@@ -1279,58 +1326,67 @@ ssize_t write(int fd, void const *buf, size_t sbuf)
 		cnt += n;
 		buf += n;
 		sbuf -= n;
-		from += (offset+n) / blocksize;
-		if ((offset+n) % blocksize)
-			from++;
+		from += (offset + n) / blocksize;
 
-		/* Case 3 special: write back the $second chunk. */
-		if (blocksize < offset + sbuf+n
-			&& offset + sbuf+n < blocksize*2
-			&& first->datain.size < blocksize*2)
-		{	/* $second should be large enough for the remains
-			 * of $buf.  Copy the remaining $buf to the head
-			 * of $second. */
-			assert(second);
-			assert(0 < sbuf && sbuf < blocksize);
-			assert(sbuf < second->datain.size);
-			memcpy(second->datain.data, buf, sbuf);
-			if (write_blocks(&input, from, second->datain.data,
-					sbuf, second->datain.size))
-				cnt += sbuf;
+		/* Did we manage to write everything out in a single burst? */
+		if ((offset + n) % blocksize)
+		{	/* Cases 1-2 and possibly 3-7. */
+			assert(!sbuf);
+			assert(!last);
+			assert(++from == input.until);
+			goto finito;
+		}
+	} /* write back $first */
+	/* Cases 1-2 are considered done. */
 
-			/* Worst case we had limited success with $first. */
-			goto success;
-		} else
-			assert(!second);
-	} else	/* Cases 6-9 */
-		assert(!first && !second);
-
-	/* Cases 4-9: bulk copy. */
-	if (sbuf >= blocksize)
-	{	/* $n := the number of bytes to write from $buf. */
-		n = sbuf - sbuf % blocksize;
+	/* Bulk copy $n..$sbuf bytes. */
+	if (!last)
+		/* Case 5/8/9 */
+		n = sbuf;
+	else if (LBA_OF(last) > from)
+		/* Cases 6-7 and possibly 4 */
+		n = (LBA_OF(last) - from) * blocksize;
+	else	/* Cases 3 and possibly 4 */
+		n = 0;
+	if (n > 0)
+	{
+		assert(n <= sbuf);
 		assert(n % blocksize == 0);
 		if (!write_blocks(&input, from, buf, n, sbuf))
-			goto success;
+			goto finito;
 		cnt += n;
 		buf += n;
 		sbuf -= n;
 		from += n / blocksize;
-	}
+	} /* bulk copy */
+	/* Cases 5/8/9 are considered done. */
 
-	/* Cases 5-7: write back the $last block */
-	if (sbuf > 0)
-	{	/* The remains of $buf must fit in $last. */
-		assert(last);
-		assert(sbuf < blocksize);
-		memcpy(last->datain.data, buf, sbuf);
-		if (write_blocks(&input, from, last->datain.data,
-				sbuf, last->datain.size))
-			cnt += sbuf;
-	} else
-		assert(!last);
+	/* The remaining cases are 3-4/6-7.  Write back the $last chunk. */
+	if (last)
+	{
+		assert(sbuf > 0);
 
-success:
+		/* It's possible, though unlikely that in case 4
+		 * $first and $last overlap. */
+		if (LBA_OF(last) < from)
+		{	/* $n := the offset in $last to write $from */
+			assert(first);
+			assert(LBA_OF(first) + first->datain.size/blocksize
+				== from);
+			n = (from - LBA_OF(last)) * blocksize;
+		} else
+			n = 0;
+		assert(last->datain.size >= n + sbuf);
+
+		memcpy(&last->datain.data[n], buf, sbuf);
+		if (!write_blocks(&input, from, &last->datain.data[n],
+				sbuf, last->datain.size - n))
+			return clean_up(errno);
+		cnt += sbuf;
+	} else	/* We must have consumed the entire $buf. */
+		assert(!sbuf);
+
+finito:
 	clean_up(0);
 	target->position += cnt;
 	return cnt;
