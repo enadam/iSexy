@@ -22,6 +22,7 @@
  *      maybe it should be encoded in the iscsi:// URL
  * TODO	provide pread(), pwrite() (don't forget *64())
  * TODO	provide stat(), lstat()
+ * TODO provide ftruncate()
  * TODO	provide the dup*() functions; don't forget about fcntl(F_DUPFD)
  * }}}
  */
@@ -94,7 +95,7 @@ static void release_target(struct target_st *target);
 static int cleanup_target(struct target_st *target);
 
 /* The middleware between libiscsi and our read()/write() overrides. */
-static int get_roi(struct input_st *input, struct output_st *output,
+static int get_rofi(struct input_st *input, struct output_st *output,
 	struct endpoint_st *src, off_t position, size_t *sbufp);
 static int read_blocks(struct input_st *input, callback_t read_cb);
 static int write_blocks(struct input_st *input, scsi_block_addr_t from,
@@ -282,7 +283,7 @@ int cleanup_target(struct target_st *target)
  * as necessary.  On error false is returned and $errno is set.  Otherwise
  * true is returned.
  */
-int get_roi(struct input_st *input, struct output_st *output,
+int get_rofi(struct input_st *input, struct output_st *output,
 	struct endpoint_st *endp, off_t position, size_t *sbufp)
 {
 	off_t n;
@@ -352,7 +353,7 @@ int get_roi(struct input_st *input, struct output_st *output,
 	/* Return the # of bytes that can effectively be read/written. */
 	*sbufp = sbuf;
 	return 1;
-} /* get_roi */
+} /* get_rofi */
 
 /*
  * This function drives libiscsi for our read() override.  Essentially
@@ -835,7 +836,7 @@ off_t lseek(int fd, off_t offset, int whence)
 		offset += disksize;
 	else if (whence != SEEK_SET)
 		goto einval;
-	if (offset < 0 || offset >= disksize)
+	if (offset < 0 || offset > disksize)
 		/* $offset is out of range. */
 		goto einval;
 
@@ -886,8 +887,8 @@ ssize_t read(int fd, void *buf, size_t sbuf)
 	}
 
 	/* Return 0 if nothing should/could be read. */
-	if (!get_roi(&input, &output, &target->endp, target->position, &sbuf))
-	{	/* $errno is set by get_roi(). */
+	if (!get_rofi(&input,&output, &target->endp, target->position,&sbuf))
+	{	/* $errno is set by get_rofi(). */
 		release_target(target);
 		return sbuf > 0 ? -1 : 0;
 	} else
@@ -1018,8 +1019,8 @@ ssize_t write(int fd, void const *buf, size_t sbuf)
 		return 0;
 
 	/* Return ENOSPC if nothing could be written. */
-	if (!get_roi(&input, &output, &target->endp, target->position, &sbuf))
-	{	/* If $sbuf > 0 $errno is set by get_roi(). */
+	if (!get_rofi(&input,&output, &target->endp, target->position,&sbuf))
+	{	/* If $sbuf > 0 $errno is set by get_rofi(). */
 		if (!sbuf)
 			errno = ENOSPC;
 		return -1;
