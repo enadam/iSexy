@@ -1012,15 +1012,19 @@ ssize_t write(int fd, void const *buf, size_t sbuf)
 	/* Check whether the $target is open for writing. */
 	if (!(target->mode & (O_WRONLY|O_RDWR)))
 	{	/* Yes, this error is returned by write() in this case. */
+		release_target(target);
 		errno = EBADF;
 		return -1;
 	} else if (!sbuf)
-		/* Nothing to write. */
+	{	/* Nothing to write. */
+		release_target(target);
 		return 0;
+	}
 
 	/* Return ENOSPC if nothing could be written. */
 	if (!get_rofi(&input,&output, &target->endp, target->position,&sbuf))
 	{	/* If $sbuf > 0 $errno is set by get_rofi(). */
+		release_target(target);
 		if (!sbuf)
 			errno = ENOSPC;
 		return -1;
