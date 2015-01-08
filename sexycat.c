@@ -115,6 +115,7 @@
  *
  * TODO cmdline: input start block, number of blocks
  * TODO cmdline: output offset
+ * TODO cmdline: maximum chunk size
  * TODO use readcapacity16 et al.
  * TODO full documentation
  *
@@ -592,8 +593,6 @@ void usage(void)
 #endif
 		"[-sS <source>] [-O] [-dD <destination>]\n",
 		Basename);
-	puts("The source code of this program is available at "
-		"https://github.com/enadam/various");
 	exit(0);
 }
 
