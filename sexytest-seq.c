@@ -4,11 +4,11 @@
  * Synopsis:
  *   sexytest-seq -Rrw <buffer-size> [-m <max>] <iscsi-url>
  *
- * This is the backend program of sexytest-seq.sh.  It runs through
- * <iscsi-url> reading or writing <buffer-size> bytes every time.
- * This size is arbitrary and doesn't need to be a multiple or divisor
- * of the target device's blocksize.  <max> makes the program stop after
- * that many read()s/write()s.  This can be useful for debugging.
+ * Open <iscsi-url> and run through it reading or writing <buffer-size>
+ * bytes every operation.  This size is arbitrary and doesn't need to be
+ * a multiple or divisor of the target device's blocksize.  <max> makes
+ * the program stop after that many read()s/write()s.  This can be useful
+ * for debugging.
  *
  * An operation mode must be chosen:
  *   -R just verifies that read()s are executed without error
@@ -20,9 +20,8 @@
  * the # of bytes read from or written to the target is printed on the
  * standard error.
  *
- * libsexywrap.so/sexywrap is expected to be in the current working directory.
- * It is loaded in run-time, so the program needs to be compiled with -pthread
- * and linked with -ldl.
+ * This program is driven by sexytest-seq.sh and should be executed by
+ * sexywrap.
  */
 
 /* Include files */
@@ -33,12 +32,6 @@
 #include <stdio.h>
 #include <fcntl.h>
 #include <time.h>
-#include <dlfcn.h>
-
-/* Private variables */
-/* These are set to the read()/write() functions of sexywrap. */
-static ssize_t (*sw_read)(int, void *, size_t);
-static ssize_t (*sw_write)(int, void const *, size_t);
 
 /* Program code */
 /* Print the usage of the program if $opt is NULL (command line argument
@@ -65,7 +58,7 @@ static size_t test_op(int rfd, int wfd, size_t sbuf)
 
 	/* Read $sbuf bytes.  It's possible that less than that much
 	 * data is available. */
-	if ((n = sw_read(rfd, buf, sizeof(buf))) < 0)
+	if ((n = read(rfd, buf, sizeof(buf))) < 0)
 	{
 		fprintf(stderr, "read: %m\n");
 		return 0;
@@ -79,7 +72,7 @@ static size_t test_op(int rfd, int wfd, size_t sbuf)
 	if (wfd >= 0)
 	{	/* Write $n bytes of $buf to $wfd.  We expect that the
 		 * buffer is fully written. */
-		if ((m = sw_write(wfd, buf, n)) < 0)
+		if ((m = write(wfd, buf, n)) < 0)
 		{
 			fprintf(stderr, "write: %m\n");
 			return 0;
@@ -96,8 +89,6 @@ static size_t test_op(int rfd, int wfd, size_t sbuf)
 /* The main function */
 int main(int argc, char const *argv[])
 {
-	void *lib;
-	int (*sw_open)(char const *, int);
 	int kind, fd;
 	char const *url;
 	unsigned sbuf, max, i;
@@ -135,25 +126,10 @@ int main(int argc, char const *argv[])
 	usage(argv[1]);
 	url = argv[1];
 
-	/* sw_open, sw_read, sw_write <- sexywrap's open, read, write */
-	if (!(lib = dlopen("./libsexywrap.so", RTLD_LAZY)))
-		lib = dlopen("./sexywrap", RTLD_LAZY);
-	assert(lib != NULL);
-	sw_open = dlsym(lib, "open");
-	assert(sw_open != NULL);
-	sw_read = dlsym(lib, "read");
-	assert(sw_read != NULL);
-	if (kind == 'w')
-	{
-		sw_write = dlsym(lib, "write");
-		assert(sw_write != NULL);
-	} else
-		sw_write = write;
-
 	/* Run the test until $max or end of file is reached. */
 	cnt = 0;
 	time(&prev);
-	fd = sw_open(url, kind == 'w' ? O_WRONLY : O_RDONLY);
+	fd = open(url, kind == 'w' ? O_WRONLY : O_RDONLY);
 	assert(fd >= 0);
 	for (i = 0; !max || i < max; i++)
 	{

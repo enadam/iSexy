@@ -44,7 +44,15 @@ do
 done
 
 # Construct the test sequence (I/O sizes).
-seq="512 1 2 3 5 12 123 511 513 1000 1023 1024 1025 1234";
+seq="512";
+if [ $# -gt 0 -a "x$1" = "x-S" ];
+then	# Don't include small buffer sizes which make this test
+	# painstakingly slow.
+	shift;
+else
+	seq="$seq 1 2 3 5 12 15 16 17";
+fi
+seq="$seq 123 511 513 1000 1023 1024 1025 1234";
 [ $blocksize -lt 2048 ] \
 	|| seq="$seq 2000 2047 2048 2049 2345";
 [ $blocksize -lt 4096 ] \
@@ -75,7 +83,7 @@ then
 	for n in $seq;
 	do
 		echo sexytest-seq -r $n "$url" '>' "$output" >&2;
-		./sexytest-seq -r $n "$url" > "$output" \
+		./sexywrap -x ./sexytest-seq -r $n "$url" > "$output" \
 			|| exit 1;
 		echo cmp "$disk" "$output" >&2;
 		cmp "$disk" "$output" \
@@ -99,7 +107,7 @@ then
 	for n in $seq;
 	do
 		echo sexytest-seq -w $n "$url" '<' "$input" >&2;
-		./sexytest-seq -w $n "$url" < "$input" \
+		./sexywrap -x ./sexytest-seq -w $n "$url" < "$input" \
 			|| exit 1;
 		sleep 3;
 		echo cmp "$disk" "$input" >&2;
