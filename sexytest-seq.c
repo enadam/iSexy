@@ -1,28 +1,31 @@
 /*
- * sexytest-simple.c -- sequential read/write test for sexywrap
+ * sexytest-seq.c -- sequential read/write test for sexywrap
  *
  * Synopsis:
- *   sexytest-simple -Rrw <chunk-size> [-m <max>] <iscsi-url>
+ *   sexytest-seq -Rrw <buffer-size> [-m <max>] <iscsi-url>
  *
- * This is the backend program of sexytest-wrapper.sh.  It runs through
- * <iscsi-url> reading/writing <chunk-size> bytes at the same time.
+ * This is the backend program of sexytest-seq.sh.  It runs through
+ * <iscsi-url> reading or writing <buffer-size> bytes every time.
  * This size is arbitrary and doesn't need to be a multiple or divisor
  * of the target device's blocksize.  <max> makes the program stop after
  * that many read()s/write()s.  This can be useful for debugging.
  *
  * An operation mode must be chosen:
- * -R just verifies that read()s are executed without error.
- * -r writes the read contents to the standard output.
- * -w writes the standard input to the iSCSI target sequentially.
+ *   -R just verifies that read()s are executed without error
+ *   -r writes the read contents to the standard output
+ *   -w writes the standard input to the iSCSI target sequentially
  *
- * Every five seconds progress is printed on the standard error.  If the chunk
- * size is low (< 10 bytes) the test can be very slow.  When finished the # of
- * bytes read from or written to the target is printed on the standard error.
+ * Every five seconds progress is printed on the standard error.  If the
+ * buffer size is low (< 10 bytes) the test can be very slow.  When finished
+ * the # of bytes read from or written to the target is printed on the
+ * standard error.
  *
  * libsexywrap.so/sexywrap is expected to be in the current working directory.
  * It is loaded in run-time, so the program needs to be compiled with -pthread
  * and linked with -ldl.
  */
+
+/* Include files */
 #include <stdlib.h>
 #include <unistd.h>
 #include <assert.h>
@@ -32,14 +35,36 @@
 #include <time.h>
 #include <dlfcn.h>
 
+/* Private variables */
+/* These are set to the read()/write() functions of sexywrap. */
 static ssize_t (*sw_read)(int, void *, size_t);
 static ssize_t (*sw_write)(int, void const *, size_t);
 
-static size_t test(int rfd, int wfd, size_t sbuf)
+/* Program code */
+/* Print the usage of the program if $opt is NULL (command line argument
+ * missing). */
+static void usage(char const *opt)
+{
+	if (opt)
+		return;
+	fprintf(stderr, "usage: "
+		"sexytest-seq -Rrw <buffer-size> [-m <max>] <iscsi-url>\n");
+	exit(1);
+} /* usage */
+
+/*
+ * Do a test operation: read $sbuf bytes from $rfd and if $wfd is given
+ * write the buffer there.  Either $rfd or $wfd can be an iSCSI or a
+ * regular file descriptor.  In the latter case sexywrap is expected
+ * to redirect to libc's standard read()/write().
+ */
+static size_t test_op(int rfd, int wfd, size_t sbuf)
 {
 	ssize_t n, m;
 	char buf[sbuf];
 
+	/* Read $sbuf bytes.  It's possible that less than that much
+	 * data is available. */
 	if ((n = sw_read(rfd, buf, sizeof(buf))) < 0)
 	{
 		fprintf(stderr, "read: %m\n");
@@ -52,7 +77,8 @@ static size_t test(int rfd, int wfd, size_t sbuf)
 		fprintf(stderr, "short read %zd\n", n);
 
 	if (wfd >= 0)
-	{
+	{	/* Write $n bytes of $buf to $wfd.  We expect that the
+		 * buffer is fully written. */
 		if ((m = sw_write(wfd, buf, n)) < 0)
 		{
 			fprintf(stderr, "write: %m\n");
@@ -65,17 +91,9 @@ static size_t test(int rfd, int wfd, size_t sbuf)
 	}
 
 	return n;
-}
+} /* test_op */
 
-static void usage(char const *opt)
-{
-	if (opt)
-		return;
-	fprintf(stderr, "usage: "
-		"sexytest-simple -Rrw <chunk-size> [-m <max>] <iscsi-url>\n");
-	exit(1);
-}
-
+/* The main function */
 int main(int argc, char const *argv[])
 {
 	void *lib;
@@ -86,6 +104,7 @@ int main(int argc, char const *argv[])
 	size_t cnt;
 	time_t prev, now;
 
+	/* Parse the command line. */
 	usage(argv[1]);
 	if (!strcmp(argv[1], "-R"))
 		kind = 'R';
@@ -97,10 +116,12 @@ int main(int argc, char const *argv[])
 		usage(NULL);
 	argv++;
 
+	/* <buffer-size> */
 	usage(argv[1]);
 	sbuf = atoi(argv[1]);
 	argv++;
 
+	/* -m */
 	usage(argv[1]);
 	if (!strcmp(argv[1], "-m"))
 	{
@@ -110,9 +131,11 @@ int main(int argc, char const *argv[])
 		argv++;
 	}
 
+	/* <iscsi-url> */
 	usage(argv[1]);
 	url = argv[1];
 
+	/* sw_open, sw_read, sw_write <- sexywrap's open, read, write */
 	if (!(lib = dlopen("./libsexywrap.so", RTLD_LAZY)))
 		lib = dlopen("./sexywrap", RTLD_LAZY);
 	assert(lib != NULL);
@@ -127,6 +150,7 @@ int main(int argc, char const *argv[])
 	} else
 		sw_write = write;
 
+	/* Run the test until $max or end of file is reached. */
 	cnt = 0;
 	time(&prev);
 	fd = sw_open(url, kind == 'w' ? O_WRONLY : O_RDONLY);
@@ -135,28 +159,31 @@ int main(int argc, char const *argv[])
 	{
 		size_t n;
 
+		/* Do the appropriate test operation. */
 		if (kind == 'R')
-			n = test(fd, -1, sbuf);
+			n = test_op(fd, -1, sbuf);
 		else if (kind == 'r')
-			n = test(fd, STDOUT_FILENO, sbuf);
+			n = test_op(fd, STDOUT_FILENO, sbuf);
 		else
-			n = test(STDIN_FILENO, fd, sbuf);
-		if (!n)
+			n = test_op(STDIN_FILENO, fd, sbuf);
+		if (!n) /* End of file */
 			break;
 		cnt += n;
 
+		/* Print progress if at least 5 seconds passed
+		 * since the last printout. */
 		time(&now);
 		if (now - prev >= 5)
 		{
 			fprintf(stderr, "cnt: %ld\n", cnt);
 			prev = now;
 		}
-	}
+	} /* test round */
 
+	/* Done */
 	close(fd);
 	fprintf(stderr, "cnt: %ld\n", cnt);
-
 	return 0;
-}
+} /* main */
 
-/* End of sexytest-simple.c */
+/* End of sexytest-seq.c */
