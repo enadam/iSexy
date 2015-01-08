@@ -183,7 +183,7 @@ static void test_round(int fd, char *disk, off_t size,
 			/* Choose a random I/O size.  We have 2-3-4 sizes
 			 * dependin on $blocksize and $optimum. */
 			n = blocksize == 512 ? 2 : 3;
-			if (optimum)
+			if (optimum > 1)
 			{	/*
 				 * We have a $scale.  If rand() falls into
 				 * [0..$opt_ival], $optimum will be chosen.
@@ -225,19 +225,18 @@ static void test_round(int fd, char *disk, off_t size,
 			 * a small +/- 16 bytes jitter to it. */
 			if (!(rand() % 5))
 			{
-				unsigned m;
-
-				if ((m = pos % n) > 0)
-					n = pos - m;
 				if (Opt_verbosity > 1)
-					puts("    ALIGNED");
+					printf("    ALIGNED %u", n);
+				n -= pos % n;
+				if (Opt_verbosity > 1)
+					printf(" -> %u\n", n);
 			} else
 				n = round(normal(n, 16));
 		} else
 		{	/* Perform I/O until the end of disk. */
-			if (Opt_verbosity > 1)
-				puts("    EOD");
 			n = size - pos;
+			if (Opt_verbosity > 1)
+				printf("    EOD (%u)\n", n);
 		}
 
 		/* Do the operation and get the expected new file position. */
@@ -253,20 +252,21 @@ static void test_round(int fd, char *disk, off_t size,
 	if (disk)
 	{	/* Compare $disk with $real:ity. */
 		char *real;
-		unsigned i;
+		unsigned n;
 
 		if (Opt_verbosity > 0)
 			puts("Verifying disk contents...");
 		assert(lseek(fd, 0, SEEK_SET) == 0);
-		assert((real = malloc(size)) != NULL);
-		assert(read(fd, real, size) == size);
-		for (i = 0; i < size; i++)
-			if (disk[i] != real[i])
-			{
-				fprintf(stderr, "mismatch at %u\n", i);
-				break;
-			}
-		assert(!memcmp(disk, real, size));
+
+		/* Compare $optimum bytes at once. */
+		optimum *= blocksize;
+		assert((real = malloc(optimum)) != NULL);
+		for (; size > 0; disk += n, size -= n)
+		{
+			n = optimum <= size ? optimum : size;
+			assert(read(fd, real, optimum) == n);
+			assert(!memcmp(disk, real, n));
+		}
 		free(real);
 	}
 } /* test_round */
@@ -285,7 +285,7 @@ int main(int argc, char *argv[])
 	/* Parse the command line. */
 	i = nop = 0;
 	nrounds = 1;
-	optimum = 0;
+	optimum = 1;
 	while ((optchar = getopt(argc, argv, "vqNn:s:o:")) != EOF)
 		switch (optchar)
 		{
@@ -308,7 +308,8 @@ int main(int argc, char *argv[])
 			i = atoi(optarg);
 			break;
 		case 'o':
-			optimum = atoi(optarg);
+			if (!(optimum = atoi(optarg)))
+				optimum = 1;
 			break;
 		default:
 			exit(1);
