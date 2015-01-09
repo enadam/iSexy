@@ -2,7 +2,7 @@
  * sexytest-seq.c -- sequential read/write test for sexywrap
  *
  * Synopsis:
- *   sexytest-seq -Rrw <buffer-size> [-m <max>] <iscsi-url>
+ *   sexytest-seq -rw [-m <max>] <iscsi-url> {<disk>|-N} [<buffer-size>]...
  *
  * Open <iscsi-url> and run through it reading or writing <buffer-size>
  * bytes every operation.  This size is arbitrary and doesn't need to be
@@ -16,7 +16,7 @@
  *   -w writes the standard input to the iSCSI target sequentially
  *
  * Every five seconds progress is printed on the standard error.  If the
- * buffer size is low (< 10 bytes) the test can be very slow.  When finished
+ * buffer size is low (< 16 bytes) the test can be very slow.  When finished
  * the # of bytes read from or written to the target is printed on the
  * standard error.
  *
@@ -32,133 +32,193 @@
 #include <stdio.h>
 #include <fcntl.h>
 #include <time.h>
+#include <sys/stat.h>
 
 /* Program code */
 /* Print the usage of the program if $opt is NULL (command line argument
  * missing). */
-static void usage(char const *opt)
+static void usage(char const *opt, int exitcode)
 {
 	if (opt)
 		return;
 	fprintf(stderr, "usage: "
-		"sexytest-seq -Rrw <buffer-size> [-m <max>] <iscsi-url>\n");
-	exit(1);
+		"sexytest-seq -rw [-m <max>] <iscsi-url> {<disk>|-N} "
+		"[<buffer-size>]...\n");
+	exit(exitcode);
 } /* usage */
-
-/*
- * Do a test operation: read $sbuf bytes from $rfd and if $wfd is given
- * write the buffer there.  Either $rfd or $wfd can be an iSCSI or a
- * regular file descriptor.  In the latter case sexywrap is expected
- * to redirect to libc's standard read()/write().
- */
-static size_t test_op(int rfd, int wfd, size_t sbuf)
-{
-	ssize_t n, m;
-	char buf[sbuf];
-
-	/* Read $sbuf bytes.  It's possible that less than that much
-	 * data is available. */
-	if ((n = read(rfd, buf, sizeof(buf))) < 0)
-	{
-		fprintf(stderr, "read: %m\n");
-		return 0;
-	} else if (n == 0)
-	{
-		fputs("eof\n", stderr);
-		return 0;
-	} else if (n < sizeof(buf))
-		fprintf(stderr, "short read %zd\n", n);
-
-	if (wfd >= 0)
-	{	/* Write $n bytes of $buf to $wfd.  We expect that the
-		 * buffer is fully written. */
-		if ((m = write(wfd, buf, n)) < 0)
-		{
-			fprintf(stderr, "write: %m\n");
-			return 0;
-		} else if (n != m)
-		{
-			fprintf(stderr, "short write %zd\n", m);
-			return 0;
-		}
-	}
-
-	return n;
-} /* test_op */
 
 /* The main function */
 int main(int argc, char const *argv[])
 {
-	int kind, fd;
+	char test;
+	off_t size;
+	unsigned max;
 	char const *url;
-	unsigned sbuf, max, i;
-	size_t cnt;
-	time_t prev, now;
+	int hdisk, hiscsi;
 
 	/* Parse the command line. */
-	usage(argv[1]);
-	if (!strcmp(argv[1], "-R"))
-		kind = 'R';
-	else if (!strcmp(argv[1], "-r"))
-		kind = 'r';
+	usage(argv[1], 0);
+	if (!strcmp(argv[1], "-r"))
+		test = 'r';
 	else if (!strcmp(argv[1], "-w"))
-		kind = 'w';
+		test = 'w';
 	else
-		usage(NULL);
+		usage(NULL, 1);
 	argv++;
 
-	/* <buffer-size> */
-	usage(argv[1]);
-	sbuf = atoi(argv[1]);
-	argv++;
-
-	/* -m */
-	usage(argv[1]);
+	/* -m | -h */
+	usage(argv[1], 1);
 	if (!strcmp(argv[1], "-m"))
 	{
 		argv++;
-		usage(argv[1]);
+		usage(argv[1], 1);
 		max = atoi(argv[1]);
 		argv++;
-	}
+	} else if (!strcmp(argv[1], "-h"))
+		usage(NULL, 0);
 
 	/* <iscsi-url> */
-	usage(argv[1]);
+	usage(argv[1], 1);
 	url = argv[1];
+	argv++;
 
-	/* Run the test until $max or end of file is reached. */
-	cnt = 0;
-	time(&prev);
-	fd = open(url, kind == 'w' ? O_WRONLY : O_RDONLY);
-	assert(fd >= 0);
-	for (i = 0; !max || i < max; i++)
+#if 0
+	puts("OPEN 1");
+	assert((hiscsi = open(url, O_RDONLY)) >= 0);
+	puts("CLOSE 1");
+	assert(!close(hiscsi));
+	puts("\nOPEN 2");
+	assert((hiscsi = open(url, O_RDONLY)) >= 0);
+	puts("DONE 2");
+	return 0;
+#endif
+
+	/* <disk> */
+	usage(argv[1], 1);
+	if (strcmp(argv[1], "-N"))
 	{
-		size_t n;
+		struct stat sb;
 
-		/* Do the appropriate test operation. */
-		if (kind == 'R')
-			n = test_op(fd, -1, sbuf);
-		else if (kind == 'r')
-			n = test_op(fd, STDOUT_FILENO, sbuf);
-		else
-			n = test_op(STDIN_FILENO, fd, sbuf);
-		if (!n) /* End of file */
-			break;
-		cnt += n;
+		assert((hdisk = open(argv[1], O_RDONLY)) >= 0);
+		assert(!fstat(hdisk, &sb));
+		size = sb.st_size;
+	} else
+	{	/* Don't verify against $hdisk. */
+		hdisk = -1;
+		size = 0;
+	}
+	argv++;
 
-		/* Print progress if at least 5 seconds passed
-		 * since the last printout. */
-		time(&now);
-		if (now - prev >= 5)
+	/* Run a test round for each <buffer-size>. */
+	for (; argv[1]; argv++)
+	{
+		off_t cnt;
+		FILE *tmpwrite;
+		struct stat sb;
+		char *buf, *disk;
+		time_t prev, now;
+		unsigned sbuf, i;
+
+		/* Allocate $buf and $disk, rewind $hdisk and create
+		 * $tmpwrite (for -w). */
+		tmpwrite = NULL;
+		sbuf = atoi(argv[1]);
+		assert((buf = malloc(sbuf)) != NULL);
+		if (hdisk >= 0)
 		{
-			fprintf(stderr, "cnt: %ld\n", cnt);
-			prev = now;
-		}
-	} /* test round */
+			assert((disk = malloc(sbuf)) != NULL);
+			assert(lseek(hdisk, 0, SEEK_SET) == 0);
+			if (test == 'w')
+				assert((tmpwrite = tmpfile()) != NULL);
+		} else
+			disk = NULL;
+
+		/* open($url) and get/verify its size */
+		assert((hiscsi = open(url,
+			test == 'w' ? O_WRONLY : O_RDONLY)) >= 0);
+		assert(!fstat(hiscsi, &sb));
+		if (hdisk < 0)
+			size = sb.st_size;
+		else
+			assert(sb.st_size == size);
+		printf("Testing %s with bufsize = %u...\n",
+			test == 'r' ? "reading" : "writing", sbuf);
+
+		/* Read/write $sbuf until $max or end of file is reached. */
+		cnt = 0;
+		time(&prev);
+		for (i = 0; (!max || i < max) && cnt < size; i++)
+		{
+			unsigned n;
+
+			/* $n <- the expected/maximal I/O size */
+			n = cnt + sbuf <= size ? sbuf : size - cnt;
+			if (test == 'r')
+			{
+				assert(read(hiscsi, buf, sbuf) == n);
+				if (disk)
+				{	/* Verify $buf against $hdisk. */
+					assert(hdisk >= 0);
+					assert(read(hdisk, disk, sbuf) == n);
+					assert(!memcmp(buf, disk, n));
+				}
+			} else
+			{	/* $test == 'w' */
+				unsigned o;
+
+				/* Randomize and write out $buf. */
+				for (o = 0; o < sbuf; o++)
+					buf[o] = rand();
+				assert(write(hiscsi, buf, sbuf) == n);
+				if (tmpwrite)
+					assert(fwrite(buf, n, 1, tmpwrite)
+						== 1);
+			} /* $test */
+
+			/* Print progress if at least 5 seconds passed
+			 * since the last printout. */
+			cnt += n;
+			time(&now);
+			if (now - prev >= 5)
+			{
+				printf("  cnt: %ld\n", cnt);
+				prev = now;
+			}
+		} /* test round */
+
+		if (tmpwrite)
+		{	/* Verify that $tmpwrite == $disk. */
+			ssize_t n;
+			assert(hdisk >= 0 && disk != NULL);
+
+			/* Let's write until $hdisk is supposedly
+			 * written back by the iSCSI daemon. */
+			printf("  verifying");
+			fflush(stdout);
+			sleep(3);
+			puts("...");
+
+			/* Read and compare $sbuf bytes a time. */
+			rewind(tmpwrite);
+			do
+			{
+				n = read(hdisk, disk, sbuf);
+				assert(n >= 0 && n <= sbuf);
+				assert(fread(buf, 1, n, tmpwrite) == n);
+				assert(!memcmp(disk, buf, n));
+			} while (n >= sbuf);
+			fclose(tmpwrite);
+		} /* compare $tmpwrite with $hdisk */
+
+		/* We could reuse $hiscsi, but let's keep test rounds
+		 * separate.  Print $cnt just to be sure. */
+		free(buf);
+		free(disk);
+		assert(!close(hiscsi));
+		printf("  cnt: %ld\n", cnt);
+	} /* for each <buffer-size> */
 
 	/* Done */
-	close(fd);
-	fprintf(stderr, "cnt: %ld\n", cnt);
 	return 0;
 } /* main */
 
