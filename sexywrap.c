@@ -76,6 +76,7 @@ extern ssize_t __write(int fd, void const *buf, size_t sbuf);
 #include <linux/kdev_t.h>
 /* }}} */
 
+/* Standard definitions */
 /*
  * When write(2)ing, this is the maximum number of blocks we'll request for
  * but won't read, because it's entirely overwritten.  If enabled 2 reads
@@ -84,6 +85,21 @@ extern ssize_t __write(int fd, void const *buf, size_t sbuf);
  * be transmitted and stored).
  */
 #define DEAD_READ			1
+
+/* Type definitions */
+/* The iSCSI target corresponding to a file descriptor. */
+struct target_st
+{
+	/*
+	 * locked:	locked when an operation is in progress on this target
+	 * mode:	the open() mode
+	 * position:	current file position of the target.
+	 */
+	pthread_mutex_t lock;
+	unsigned mode;
+	off_t position;
+	struct endpoint_st endp;
+};
 
 /* Private functions {{{ */
 /* Creating/finding/returning targets. */
@@ -106,13 +122,7 @@ static int real_fxstat(int version, int fd, struct stat *sbuf);
 /* }}} */
 
 /* Private variables {{{ */
-static struct target_st
-{
-	pthread_mutex_t lock;
-	unsigned mode;
-	off_t position;
-	struct endpoint_st endp;
-} Targets[16] =
+static struct target_st Targets[16] =
 {
 	{ PTHREAD_MUTEX_INITIALIZER },
 	{ PTHREAD_MUTEX_INITIALIZER },
@@ -646,6 +656,7 @@ int open(char const *fname, int flags, ...)
 		calibrate_endpoint(&target->endp, 0);
 		target->endp.maxreqs = DFLT_INITIAL_MAX_ISCSI_REQS;
 		target->mode = flags & (O_RDONLY | O_WRONLY | O_RDWR);
+		target->position = 0;
 	}
 
 	release_target(target);
@@ -716,7 +727,7 @@ int dup3(int oldfd, int newfd, int flags)
 }
 /* dup }}} */
 
-/* cleanup_target() the one associated with $fd. {{{ */
+/* close(): cleanup_target() the one associated with $fd. {{{ */
 int close(int fd)
 {
 	struct target_st *target;
