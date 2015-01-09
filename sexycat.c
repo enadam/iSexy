@@ -115,7 +115,6 @@
  *
  * TODO cmdline: input start block, number of blocks
  * TODO cmdline: output offset
- * TODO cmdline: maximum chunk size
  * TODO use readcapacity16 et al.
  * TODO full documentation
  *
@@ -1039,6 +1038,7 @@ int process_output_queue(int fd,
 	for (;;)
 	{
 		/* Add a new (possibly the first) buffer to the batch. */
+		assert(ntasks > 0);
 		if (fd >= 0)
 			add_to_output_iov(output, tasks[0], niov);
 		niov++;
@@ -1077,15 +1077,8 @@ int process_output_queue(int fd,
 			 * the output is $seekable. */
 			/* The next batch starts from &tasks[0]. */
 			from = tasks;
-			tasks++;
-			ntasks--;
 			niov = 0;
-
-			/* $from is the first chunk of the batch,
-			 * move $block forward. */
-			assert(from[0]->datain.size % dst->blocksize == 0);
-			block = LBA_OF(from[0])
-				+ from[0]->datain.size / dst->blocksize;
+			block = LBA_OF(from[0]);
 
 			/* Since there's a gap between the previous and this
 			 * new batch we need to seek to $first when flushing
