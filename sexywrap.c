@@ -276,6 +276,11 @@ int cleanup_target(struct target_st *target)
 		target->endp.url = NULL;
 	}
 
+#if 1	/* Due to a bug in libiscsi we can't reuse the $iscsi context yet. */
+	iscsi_destroy_context(iscsi);
+	target->endp.iscsi = NULL;
+#endif
+
 	release_target(target);
 	return ret;
 } /* cleanup_target */
