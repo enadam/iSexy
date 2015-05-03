@@ -7,12 +7,12 @@
  *
  * To build it as a shared library:
  * cc -shared -pthread -Wall -O2 -s -fPIC -lrt -ldl -liscsi sexywrap.c \
- *	-o libsexywrap.so;
+ *	-o libsexywrap.so
  * Usage: LD_PRELOAD=./libsexywrap.so cat <iscsi-url> > ide
  *
  * To build a combined binary of the wrapper library and the sexycat program:
  * cc -shared -pie -pthread -Wall -O2 -s -fPIE -DSEXYCAT -lrt -ldl -liscsi \
- *	sexywrap.c -o sexywrap;
+ *	sexywrap.c -o sexywrap
  * Usage: sexywrap -x cat <iscsi-url> > ide
  * Or you can use the LD_PRELOAD method as well.
  *
@@ -46,7 +46,9 @@ extern ssize_t __write(int fd, void const *buf, size_t sbuf);
 
 /* Provide sexycat.c with such definitions that point to the real syscalss,
  * because we certainly want it to use them rather than our overrides. */
-#define SEXYWRAP
+#ifndef SEXYWRAP
+# define SEXYWRAP
+#endif
 #define open				__open
 #define dup(fd)				syscall(__NR_dup, fd)
 #define dup2(oldfd, newfd)		syscall(__NR_dup2, oldfd, newfd)
@@ -583,9 +585,16 @@ int open(char const *fname, int flags, ...)
 			/* $errno is expected to be set. */
 			return -1;
 		if (target)
+		{
 			target->endp.iscsi = iscsi;
+			target->endp.initiator = initiator;
+		}
 	} else 
+	{
 		iscsi = target->endp.iscsi;
+		assert(target->endp.initiator != NULL);
+		initiator = NULL; // warning suppression
+	}
 
 	/* Try to parse $fname as an iscsi:// URL.  It might not be. */
 	assert(iscsi != NULL);
@@ -638,7 +647,6 @@ int open(char const *fname, int flags, ...)
 	if (target)
 	{
 		assert(target->endp.url == url);
-		target->endp.initiator = initiator;
 	} else if ((target = new_target(iscsi)) != NULL)
 	{
 		target->endp.url = url;
