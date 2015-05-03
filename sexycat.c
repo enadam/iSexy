@@ -406,9 +406,12 @@ struct output_st
 			/* The actual number of buffers in the batch. */
 			unsigned enqueued;
 
-			/* When a chunk is read it's placed in $tasks.
+			/*
+			 * When a chunk is read it's placed in $tasks.
+			 * This is a packed array, no holes are allowed.
 			 * When the batch is flushed the buffers are
-			 * copied to $iov, a preallocated iovec array. */
+			 * copied to $iov, a preallocated iovec array.
+			 */
 			struct iovec *iov;
 			struct scsi_task **tasks;
 		};
@@ -1002,9 +1005,14 @@ void add_output_chunk(struct chunk_st *chunk)
 	{
 		unsigned n;
 
-		/* We've used up all $output->tasks.  Allocate +25%. */
-		n = output->max + output->max/4;
+		/* $output->tasks is either unallocated or we've used up
+		 * all the free entries.  Allocate it or 25% more. */
+		n = output->max
+			? output->max + output->max/4
+			: Opt_max_output_queue;
 		xrealloc(&output->tasks, sizeof(*output->tasks) * n);
+		memset(&output->tasks[output->enqueued], 0,
+			sizeof(*output->tasks) * (n-output->max));
 		xrealloc(&output->iov, sizeof(*output->iov) * n);
 		output->max = n;
 	}
@@ -1066,6 +1074,7 @@ int process_output_queue(int fd,
 		/* We have a non-seekable destination and the first
 		 * $block is not the next one, so we can't write. */
 		return 0;
+	memset(&output->iov[0], 0, sizeof(*output->iov) * output->max);
 
 	/* Send all of $output->enqueued batches. */
 	assert(output->max > 0);
@@ -1146,6 +1155,8 @@ int process_output_queue(int fd,
 			Last.written = block - 1;
 		memmove(from, tasks, sizeof(*tasks) * ntasks);
 		output->enqueued -= tasks - from;
+		memset(&output->tasks[output->enqueued], 0,
+			sizeof(*output->tasks));
 
 		/* Are we done with all $tasks? */
 		if (!ntasks)
@@ -2687,11 +2698,8 @@ int main(int argc, char *argv[])
 		 * in order to calculate the output offset. */
 		dst.endp.blocksize = src.endp.blocksize;
 
-		/* Allocate $output->iov and $output->tasks,
-		 * which are only needed in this mode. */
-		output.max = Opt_max_output_queue;
-		output.iov = xmalloc(sizeof(*output.iov) * output.max);
-		output.tasks = xmalloc(sizeof(*output.tasks) * output.max);
+		/* $output.max, .iov and .tasks will be allocated in
+		 * add_output_chunk(). */
 	} else if (!init_endpoint(&dst.endp, dst.url, dst.fallback_blocksize))
 		die(NULL);
 	else if (src.is_local)
