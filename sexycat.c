@@ -116,12 +116,20 @@
  * (This could be improved in the future.)  Requests are sent parallel,
  * with a backoff strategy if the server feels overloaded.
  *
- * TODO cmdline: input start block, number of blocks
- * TODO cmdline: output offset
+ * TODO max total size of $output_st::tasks (XXX)
+ * TODO input: skip, nblocks
+ * TODO output: seek
+ * TODO end-to-end checksum
+ * TODO checksum per every nth block/chunk
+ * TODO request timeout (don't trust the server)
+ * TODO remote_to_local: force non-seekable
  * TODO use readcapacity16 et al.
  * TODO full documentation
+ * TODO document the $LIBISCSI_* environment variables
+ * TODO make $Info line-buffered if it's redirected to stderr
+ * TODO clarify when to use warn() + return 0 vs. die()
  *
- * Dependecies: libiscsi 1.4
+ * Dependecies: libiscsi
  * Compilation: cc -Wall -O2 -s -lrt -liscsi sexycat.c -o sexycat
  *
  * The silly `sexy' name refers to the connection with SCSI, which originally
@@ -474,12 +482,14 @@ static int is_iscsi_error(
 static int run_iscsi_event_loop(struct iscsi_context *iscsi,
 	unsigned events);
 
+#ifdef SEXYCAT
 static void add_output_chunk(struct chunk_st *chunk);
 static void add_to_output_iov(struct output_st *output,
 	struct scsi_task *task, unsigned niov);
 static int process_output_queue(int fd,
 	struct endpoint_st const *dst, struct output_st *output,
 	int more_to_come);
+#endif /* SEXYCAT */
 
 static void chunk_written(struct iscsi_context *iscsi, int status,
 	void *command_data, void *private_data);
@@ -538,8 +548,10 @@ static int remote_to_remote(struct input_st *input);
 static int Opt_verbosity, Opt_progress;
 
 /* -bB */
+#ifdef SEXYCAT
 static unsigned Opt_min_output_batch = DFLT_MIN_OUTPUT_BATCH;
 static unsigned Opt_max_output_queue = DFLT_INITIAL_MAX_OUTPUT_QUEUE;
+#endif
 
 /* -rR */
 static unsigned Opt_request_retry_time  = DFLT_ISCSI_REQUEST_RETRY_PAUSE;
@@ -552,8 +564,8 @@ static unsigned Opt_maxreqs_degradation = DFLT_ISCSI_MAXREQS_DEGRADATION;
  * set up for sexywrap by default, but if we're sexycat, that's changed in
  * main() right away.
  */
-static FILE *Info;
 static char const *Basename = "sexywrap";
+static __attribute__((unused)) FILE *Info;
 
 /*
  * -- $Start: when the program was started; used by report_progress()
@@ -752,6 +764,7 @@ void report_progress(void)
 #endif /* SEXYCAT */
 } /* report_progress */
 
+#ifdef SEXYCAT
 void *xmalloc(size_t size)
 {
 	void *ptr;
@@ -771,6 +784,7 @@ void xrealloc(void *ptrp, size_t size)
 		die("realloc(%zu): %m", size);
 	*(void **)ptrp = ptr;
 }
+#endif /* SEXYCAT */
 
 /* On failure $errno is set. */
 int xpoll(struct pollfd *pfd, unsigned npolls)
@@ -840,6 +854,7 @@ int xfpoll(struct pollfd *pfd, unsigned npolls, struct input_st *input)
 	return ret;
 }
 
+#ifdef SEXYCAT
 /*
  * Read $fd until $buf is filled with $sbuf bytes.  Only returns less
  * than that if EOF is reached or an error is ecountered.  This latter
@@ -867,7 +882,7 @@ int xread(int fd, unsigned char *buf, size_t sbuf, size_t *nreadp)
 	} /* until $buf is filled */
 
 	return 1;
-}
+} /* xread */
 
 /* Writes the full $iov to $fd.  On error 0 is returned and $errno is set. */
 int xpwritev(int fd, struct iovec *iov, unsigned niov, off_t offset, int seek)
@@ -915,7 +930,8 @@ int xpwritev(int fd, struct iovec *iov, unsigned niov, off_t offset, int seek)
 		iov->iov_len  -= ret;
 		iov->iov_base += ret;
 	}
-}
+} /* xpwritev */
+#endif /* SEXYCAT */
 
 int is_connection_error(struct iscsi_context *iscsi, char const *which,
 	unsigned revents)
@@ -967,6 +983,7 @@ int run_iscsi_event_loop(struct iscsi_context *iscsi, unsigned events)
 		return 1;
 }
 
+#ifdef SEXYCAT
 void add_output_chunk(struct chunk_st *chunk)
 {
 	unsigned i;
@@ -1141,7 +1158,9 @@ int process_output_queue(int fd,
 
 	return 0;
 }
+#endif /* SEXYCAT */
 
+#ifdef SEXYCAT
 void chunk_written(struct iscsi_context *iscsi, int status,
 	void *command_data, void *private_data)
 {
@@ -1257,6 +1276,7 @@ void chunk_read(struct iscsi_context *iscsi, int status,
 	} else
 		chunk->input->output->nreqs++;
 }
+#endif /* SEXYCAT */
 
 /* Return the optimal number of bytes to read/write [$from..$until[ blocks
  * taking the target's optimal transfer size and granuality into account. */
@@ -1760,6 +1780,7 @@ struct scsi_task *write_endpoint(struct endpoint_st const *endp,
 #endif
 } /* write_endpoint */
 
+#ifdef SEXYCAT
 void destroy_endpoint(struct endpoint_st *endp)
 {
 	if (endp->iscsi)
@@ -1784,6 +1805,7 @@ void print_endpoint(struct endpoint_st const *endp)
 		endp->which, endp->nblocks, endp->blocksize,
 		endp->granuality, endp->optimum, endp->maximum);
 } /* print_endpoint */
+#endif /* SEXYCAT */
 
 /* Calculate the optimal transfer size based on the target's preferences.
  * $endp is assumed to be initialized with stat_endpoint(). */
@@ -1953,6 +1975,7 @@ int stat_endpoint(struct endpoint_st *endp, unsigned fallback_blocksize)
 	return 1;
 }
 
+#ifdef SEXYCAT
 int init_endpoint(struct endpoint_st *endp, char const *url,
 	unsigned fallback_blocksize)
 {
@@ -1975,6 +1998,7 @@ int init_endpoint(struct endpoint_st *endp, char const *url,
 
 	return 1;
 }
+#endif /* SEXYCAT */
 
 #ifdef SEXYCAT /* {{{ */
 /* Upload a local file to a remote iSCSI target. {{{ */
