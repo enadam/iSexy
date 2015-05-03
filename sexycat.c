@@ -51,6 +51,8 @@
  *				device(s) and log in and print the capacity
  *				of the iSCSI target(s).
  *   -O				Overwrite the local destination <file-name>.
+ *   -V				Before starting downloading ensure that the
+ *				necessary free disk space is available.
  *   -v				Be more verbose:
  *				-- at level 2 it's printed when a block is
  *				   being re-read or rewritten due to a fault
@@ -173,6 +175,7 @@
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
+#include <sys/statvfs.h>
 
 #include <linux/limits.h>
 
@@ -536,9 +539,14 @@ static int stat_endpoint(struct endpoint_st *endp,
 static int init_endpoint(struct endpoint_st *endp, char const *url,
 	unsigned fallback_blocksize);
 
+#ifdef SEXYCAT
 static int local_to_remote(struct input_st *input);
-static int remote_to_local(struct input_st *input, unsigned output_flags);
+static int open_output(struct endpoint_st *dst, struct endpoint_st const *src,
+	int overwrite, int check_free_space);
+static int remote_to_local(struct input_st *input,
+	int overwrite, int check_free_space);
 static int remote_to_remote(struct input_st *input);
+#endif /* SEXYCAT */
 /* }}} */
 
 /* Private variables {{{ */
@@ -605,7 +613,7 @@ void usage(void)
 #ifdef SEXYWRAP
 		"[-x <program> [<args>...]] "
 #endif
-		"[-sS <source>] [-O] [-dD <destination>]\n",
+		"[-sS <source>] [-OV] [-dD <destination>]\n",
 		Basename);
 	exit(0);
 }
@@ -2142,65 +2150,126 @@ int local_to_remote(struct input_st *input)
 	if (Opt_verbosity > 0)
 		info("written %u blocks", input->until);
 
-	/* Close the input file if we opened it. */
+	/* Close the input file if we opened it.  (It feels wrong to close
+	 * stdin, because the standard file descriptors are supposed to be
+	 * open all the times.) */
 	if (src->fname)
 		close(pfd[0].fd);
+
 	return 1;
 } /* local_to_remote }}} */
 
 /* Download from a remote iSCSI target to a local file. {{{ */
-int remote_to_local(struct input_st *input, unsigned output_flags)
+int open_output(struct endpoint_st *dst, struct endpoint_st const *src,
+	int overwrite, int check_free_space)
 {
 	struct stat sb;
+	int fd, deletable;
+
+	/* Open the output file.  Fail if the file already exists and we
+	 * weren't invoked with -O and the file is a regular one (not a
+	 * pipe or a device node). */
+	deletable = 0;
+	memset(&sb, 0, sizeof(sb));
+	if (!dst->fname || !strcmp(dst->fname, "-"))
+	{	/* Output is stdout. */
+		dst->fname = NULL;
+		fd = STDOUT_FILENO;
+	} else if ((fd = open(dst->fname, O_WRONLY, 0666)) >= 0)
+	{	/* File exists.  Is that OK? */
+		if (!overwrite)
+		{	/* We weren't invoked with -O. */
+			if (fstat(fd, &sb) < 0)
+				goto out;
+			if (S_ISREG(sb.st_mode))
+			{	/* File exists and we can't $overwrite it. */
+				errno = EEXIST;
+				goto out;
+			}
+		}
+	} else if ((fd = open(dst->fname,O_CREAT|O_WRONLY|O_EXCL,0666)) >= 0)
+		/* We created the file, so it should be deleted on error. */
+		deletable = 1;
+	else
+		goto out;
+
+	/* Get the file type. */
+	if (!sb.st_mode && fstat(fd, &sb) < 0)
+		goto out;
+
+	/* It's only meaningful to check the free space if the output
+	 * is a regular file, otherwise it doesn't occupy space on the
+	 * file system. */
+	if (check_free_space && S_ISREG(sb.st_mode))
+	{
+		fsblkcnt_t space;
+		struct statvfs fssb;
+		off_t required, available;
+
+		/* The manual prefers fstatvfs() over fstatfs(). */
+		if (fstatvfs(fd, &fssb) < 0)
+		{
+			if (dst->fname)
+				warn("statfs(%s): %m", dst->fname);
+			else
+				warn("statfs(stdout): %m");
+			goto out0;
+		} /* fstatvfst() failed */
+
+		/* Privileged users might have more free $space available,
+		 * but unfortunately we have no means to determine which
+		 * are those privileged users. */
+		space = geteuid() > 0 ? fssb.f_bavail : fssb.f_bfree;
+		required = (off_t)src->blocksize * src->nblocks;
+		available = (off_t)fssb.f_bsize * space;
+		if (required > available)
+		{
+			warn("Not enough free space is available "
+			     "(required: %luB, available: %luB)",
+			     required, available);
+			goto out0;
+		}
+	} /* $check_free_space */
+
+	/* Truncate the file to 0 bytes (if we created it then it's empty). */
+	if (!deletable && S_ISREG(sb.st_mode) && ftruncate(fd, 0) < 0)
+		goto out;
+
+	/* Determine whether $dst->seekable (then it can't be a named pipe).
+	 * If it is we'll possibly use pwrite(). */
+	dst->seekable = !S_ISFIFO(sb.st_mode) && lseek(fd, 0, SEEK_CUR) == 0;
+
+	/* All's OK. */
+	return fd;
+
+out:	/* Print $errno. */
+	if (dst->fname)
+		warn_errno(dst->fname);
+	else
+		warn_errno("(stdout)");
+
+out0:	/* close()/unlink() the file and return with failure. */
+	if (dst->fname)
+	{
+		close(fd);
+		if (deletable)
+			unlink(dst->fname);
+	}
+	return -1;
+} /* open_output */
+
+int remote_to_local(struct input_st *input,
+	int overwrite, int check_free_space)
+{
 	ino_t iscsi_src_ino;
 	struct pollfd pfd[2];
 	struct endpoint_st *src = input->src;
 	struct endpoint_st *dst = input->dst;
 
-	/* Open the output file.  Fail if the file already exists
-	 * and we weren't invoked with -O.  Exceptions are device
-	 * nodes, which won't be considered overwritten. */
-	memset(&sb, 0, sizeof(sb));
-	output_flags |= O_CREAT | O_WRONLY;
-	if (!dst->fname || !strcmp(dst->fname, "-"))
-	{	/* Output is stdout. */
-		dst->fname = NULL;
-		pfd[1].fd = STDOUT_FILENO;
-	} else if ((pfd[1].fd = open(dst->fname, output_flags, 0666)) < 0)
-	{	/* Couldn't create/open $dst with $output_flags.  Open it
-		 * without O_CREAT|O_EXCL if it exists and check whether
-		 * it's a device node. */
-		if (errno != EEXIST
-			|| ((pfd[1].fd = open(dst->fname,
-				output_flags & ~(O_CREAT|O_EXCL), 0666)) < 0)
-		    	|| fstat(pfd[1].fd, &sb) < 0
-			|| !(S_ISCHR(sb.st_mode) || S_ISBLK(sb.st_mode)))
-		{
-			warn_errno(dst->fname);
-			close(pfd[1].fd);
-			return 0;
-		}
-	} /* open $dst->fname */
-
-	/* Determine whether $dst->seekable.  If it is we'll possibly
-	 * use pwrite(). */
-	dst->seekable = lseek(pfd[1].fd, 0, SEEK_CUR) != (off_t)-1;
-	if (dst->seekable)
-	{	/* For this to work we need to allocate space in advance,
-		 * pwrite() will return ESPIPE.  The exceptions are device
-		 * nodes are exceptions, because they can't be truncated. */
-		if (!sb.st_mode)
-			/* Haven't fstat()ed $dst. */
-			fstat(pfd[1].fd, &sb);
-		if (!(S_ISCHR(sb.st_mode) || S_ISBLK(sb.st_mode))
-			&& ftruncate(pfd[1].fd,
-				(off_t)src->blocksize * src->nblocks) < 0)
-		{	/* Either fstat() failed or it's not a device node
-			 * and it can't be ftruncate()d. */
-			warn_errno(dst->fname);
-			return 0;
-		}
-	} /* $dst->seekable */
+	/* Initialize output. */
+	if ((pfd[1].fd = open_output(dst, src,
+			overwrite, check_free_space)) < 0)
+		return 0;
 
 	/* Loop until $input->until is reached. */
 	iscsi_src_ino = 0;
@@ -2350,11 +2419,10 @@ int main(int argc, char *argv[])
 
 		struct endpoint_st endp;
 	} src, dst;
-	int isok, optchar, nop;
-	unsigned output_flags;
 	struct input_st input;
 	struct output_st output;
 	char const *optstring;
+	int isok, optchar, nop, overwrite, check_free_space;
 
 	/* Initialize diagnostic output. */
 	Info = stdout;
@@ -2375,7 +2443,7 @@ int main(int argc, char *argv[])
 	/* Parse the command line */
 	nop = 0;
 	Opt_verbosity = 1;
-	output_flags = O_EXCL;
+	overwrite = check_free_space = 0;
 
 	/* These defaults are used in --debug mode. */
 	src.url = "iscsi://127.0.0.1/iqn.2014-07.net.nsn-net.timmy:try/0";
@@ -2392,7 +2460,7 @@ int main(int argc, char *argv[])
 #else
 # define SEXYWRAP_CMDLINE			/* none */
 #endif
-	optstring = "hvqp:i:s:S:f:c:m:I:d:D:F:C:M:Ob:B:r:R:N"
+	optstring = "hvqp:i:s:S:f:c:m:I:d:D:F:C:M:OVb:B:r:R:N"
 		SEXYWRAP_CMDLINE;
 
 	while ((optchar = getopt(argc, argv, optstring)) != EOF)
@@ -2464,8 +2532,10 @@ int main(int argc, char *argv[])
 			dst.desired_optimum = atoi(optarg);
 			break;
 		case 'O':
-			output_flags &= ~O_EXCL;
-			output_flags |= O_TRUNC;
+			overwrite = 1;
+			break;
+		case 'V':
+			check_free_space = 1;
 			break;
 
 		/* Error recovery */
@@ -2729,7 +2799,7 @@ int main(int argc, char *argv[])
 	} else if (LOCAL_TO_REMOTE(&input))
 		isok = local_to_remote(&input);
 	else if (REMOTE_TO_LOCAL(&input))
-		isok = remote_to_local(&input, output_flags);
+		isok = remote_to_local(&input, overwrite, check_free_space);
 	else
 		isok = remote_to_remote(&input);
 
