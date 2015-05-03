@@ -630,6 +630,12 @@ void warnv(char const *fmt, va_list *args)
 		return;
 #endif
 
+	/* If $stdout and $stderr are redirected to the same file,
+	 * make sure that they're not mixed up because $stdout is
+	 * buffered. */
+	if (Info && Info != stderr)
+		fflush(Info);
+
 	fprintf(stderr, "%s: ", Basename);
 	vfprintf(stderr, fmt, *args);
 	putc('\n', stderr);
@@ -650,6 +656,8 @@ void warn_errno(char const *op)
 	if (!stderr)
 		return;
 #endif
+	if (Info && Info != stderr)
+		fflush(Info);
 	fprintf(stderr, "%s: %s: %m\n", Basename, op);
 }
 
@@ -659,6 +667,8 @@ void warn_iscsi(char const *op, struct iscsi_context *iscsi)
 	if (!stderr)
 		return;
 #endif
+	if (Info && Info != stderr)
+		fflush(Info);
 	if (op)
 		fprintf(stderr, "%s: %s: %s\n", Basename, op,
 			iscsi_get_error(iscsi));
