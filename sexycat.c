@@ -17,6 +17,9 @@
  *				file won't be overwritten.  If the file is
  *				seekable (ie. it's a regular file) its size
  *				is set to the capacity of the iSCSI source.
+ *				WARNING (XXX): if the file is non-seekable
+ *				and you're copying multi-gigabyte disks,
+ *				you'll likely run out of memory.
  *   -D -			Dump the source iSCSI disk to the standatrd
  *				output.  This is the default is none of -dD
  *				is specified.
@@ -995,6 +998,9 @@ void add_output_chunk(struct chunk_st *chunk)
 	chunk->read_task = NULL;
 	output->enqueued++;
 
+	if (Last.writing < chunk->address)
+		Last.writing = chunk->address;
+
 	/* Return $chunk to the list of unused chunks. */
 	return_chunk(chunk);
 }
@@ -1030,10 +1036,13 @@ int process_output_queue(int fd,
 		return 0;
 	tasks = from = output->tasks;
 	block = LBA_OF(from[0]);
+	if (!dst->seekable && !(!Last.written && !block)
+			&& block != Last.written + 1)
+		/* We have a non-seekable destination and the first
+		 * $block is not the next one, so we can't write. */
+		return 0;
 
-	/* Send all of $output->enqueued batches.
-	 * We'd be fine without gotos, they're only used to skip conditions
-	 * known to be false. */
+	/* Send all of $output->enqueued batches. */
 	assert(output->max > 0);
 	for (;;)
 	{
@@ -1093,9 +1102,7 @@ int process_output_queue(int fd,
 			break;
 
 		/* Flush $output->iov. */
-		if (!niov)
-			/* ...but it's empty. */
-			return 0;
+		assert(niov > 0);
 		if (fd < 0)
 			/* We would have flushed something. */
 			return 1;
@@ -1110,17 +1117,22 @@ int process_output_queue(int fd,
 		/* Delete output buffers [$from..$tasks[. */
 		for (t = from; t < tasks; t++)
 			scsi_free_scsi_task(*t);
+		if (Last.written < block - 1)
+			Last.written = block - 1;
 		memmove(from, tasks, sizeof(*tasks) * ntasks);
 		output->enqueued -= tasks - from;
 
 		/* Are we done with all $tasks? */
 		if (!ntasks)
-			return 1;
+			break;
 
 		/* Now $from points at the first unvisited task.
 		 * Continue from that point. */
 		tasks = from;
 		block = LBA_OF(from[0]);
+		if (!dst->seekable && block != Last.written + 1)
+			/* The next $block is not the subsequent one. */
+			break;
 
 		/* Keep $need_to_seek, because pwrite*() doesn't change
 		 * the file offset. */
@@ -2223,9 +2235,10 @@ int remote_to_local(struct input_st *input, unsigned output_flags)
 	if (Opt_verbosity > 0)
 		info("read %u blocks", input->until);
 
-	/* Close the input file if we opened it. */
-	if (dst->fname)
-		close(pfd[1].fd);
+	/* Close the output file and make sure it's succesful (no pending
+	 * write errors). */
+	if (close(pfd[1].fd) < 0)
+		die("%s: %m", dst->fname ? dst->fname : "(stdout)");
 
 	return 1;
 } /* remote_to_local }}} */
