@@ -210,7 +210,7 @@ struct target_st *find_target(int fd)
 			return &Targets[i];
 		}
 		pthread_mutex_unlock(&Targets[i].lock);
-	} /* for all @Targets */
+	} /* for all $Targets */
 
 	return NULL;
 } /* find_target */
@@ -385,7 +385,7 @@ int read_blocks(struct input_st *input, callback_t read_cb)
 	struct endpoint_st *src = input->src;
 
 	/* Loop until we're out of read requests. */
-	assert(!input->failed);
+	assert(!input->in_use);
 	assert(input->unused && input->nunused);
 	pfd.fd = iscsi_get_fd(src->iscsi);
 	iscsi_src_ino = 0;
@@ -400,7 +400,7 @@ int read_blocks(struct input_st *input, callback_t read_cb)
 			break;
 		if (!start_iscsi_read_requests(input, read_cb))
 			break;
-		if (!input->nreqs && !input->failed)
+		if (!input->in_use)
 			return 1;
 
 		/* Wait for input. */
@@ -442,7 +442,7 @@ int write_blocks(struct input_st *input, scsi_block_addr_t from,
 	scsi_block_addr_t until;
 	struct endpoint_st *dst = input->dst;
 
-	assert(!input->failed);
+	assert(!input->in_use);
 	assert(input->unused && input->nunused);
 
 	/* $sbuf := round_up($min, $blocksize) */
@@ -466,12 +466,14 @@ int write_blocks(struct input_st *input, scsi_block_addr_t from,
 	for (;;)
 	{
 		int ret;
+		struct chunk_st *chunk;
 
 		/*
-		 * Called when a chunk is/not written and add it to
-		 * the failed list or returns it to the unused list.
-		 * This callback is required by restart_requests()
-		 * to know what's completed and what's failed.
+		 * Called when a chunk is/not written or cancelled
+		 * and re-queue it in the $in_use list or return it
+		 * to the unused list.  This callback is required
+		 * by restart_requests() to know what's completed
+		 * and what's failed.
 		 */
 		void write_cb(struct iscsi_context *iscsi, int status,
 			void *command_data, void *private_data)
@@ -481,46 +483,53 @@ int write_blocks(struct input_st *input, scsi_block_addr_t from,
 
 			assert(task != NULL);
 			assert(chunk != NULL);
+			assert(chunk->task == task);
 
 			assert(chunk->input->output->nreqs > 0);
 			chunk->input->output->nreqs--;
 
-			if (is_iscsi_error(iscsi, task, "write10", status))
+			SET_TASK_PTR(task, SCSI_OPCODE_WRITE10);
+			if (status == SCSI_STATUS_CANCELLED)
 			{
-				scsi_free_scsi_task(task);
-				chunk_failed(chunk);
-			} else
+				task->status = status;
+				return;
+			} else if (!is_iscsi_error(iscsi, task, "write10",
+				status))
 			{
+				chunk->time_to_retry = 0;
+				chunk->s.wrpbuf = NULL;
 				scsi_free_scsi_task(task);
+				chunk->task = NULL;
 				return_chunk(chunk);
-			}
+			} else
+				chunk_failed(chunk);
 		} /* write_cb */
 
-		/* Recreate failed iSCSI requests.
+		/* Recreate failed/timed out iSCSI requests.
 		 * Return if the job is done. */
 		if (!restart_requests(input, NULL, write_cb))
 			break;
-		if (!sbuf && !input->output->nreqs && !input->failed)
+		if (!sbuf && !input->in_use)
 			return 1;
 
-		/* Add new write request if we can ($input has $unused
-		 * chunks). */
-		if (sbuf > 0 && input->unused)
-		{
-			struct chunk_st *chunk;
-
-			chunk = input->unused;
-			take_chunk(chunk);
-
+		if (!sbuf)
+			/* Nothing more to write. */;
+		else if ((chunk = get_chunk(input)) != NULL)
+		{	/* Add new write request if we can. */
 			chunk->sbuf = read_chunk_size(NULL, dst, from, until);
-			chunk->u.wbuf = buf;
-			if (!write_endpoint(dst, from,
-					chunk->u.wbuf, chunk->sbuf,
-					write_cb, chunk))
+			if (!(chunk->task = write_endpoint(dst, from,
+				buf, chunk->sbuf, write_cb, chunk)))
+			{
+				return_chunk(chunk);
 				break;
-			input->output->nreqs++;
+			} else
+			{
+				chunk->s.wrpbuf = buf;
+				chunk_started(chunk);
+				input->output->nreqs++;
+			}
 
-			buf  += chunk->sbuf;
+			buf += chunk->sbuf;
 			if (sbuf > chunk->sbuf)
 				sbuf -= chunk->sbuf;
 			else	/* $sbuf < we wrote <= $max */
@@ -658,7 +667,8 @@ int open(char const *fname, int flags, ...)
 	}
 
 	/* Connect to the target iSCSI. */
-	if (!connect_endpoint(iscsi, url) || !stat_endpoint(&target->endp, 0))
+	if (!connect_endpoint(iscsi, url, 0)
+		|| !stat_endpoint(&target->endp, 0))
 	{	/* Return some generic error.  The called functions have
 		 * already logged the real reason. */
 		cleanup_target(target);
@@ -666,7 +676,7 @@ int open(char const *fname, int flags, ...)
 		return -1;
 	} else
 	{	/* Finishing touches. */
-		calibrate_endpoint(&target->endp, 0);
+		calibrate_endpoint(&target->endp, NULL);
 		target->endp.maxreqs = DFLT_INITIAL_MAX_ISCSI_REQS;
 		target->mode = flags & (O_RDONLY | O_WRONLY | O_RDWR);
 		target->position = 0;
@@ -768,15 +778,8 @@ int real_fxstat(int version, int fd, struct stat *sbuf)
 	if (use_fstat)
 		return libcs_fstat(fd, sbuf);
 
-	/*
-	 * The way dlsym(3) proposes to resolve functions is not particularly
-	 * threading-friendly, but we can't help much: even if we protected
-	 * ourselves with a mutex, there could be other concurrent users of
-	 * libdl.
-	 */
-	dlerror();
-
 	/* Prefer __fxstat() because we have a $version number to honor. */
+	dlerror();
 	libcs_fxstat = dlsym(RTLD_NEXT, "__fxstat");
 	if (libcs_fxstat || !dlerror())
 	{
@@ -927,37 +930,41 @@ ssize_t read(int fd, void *buf, size_t sbuf)
 		void *command_data, void *private_data)
 	{
 		size_t offset, n;
+		scsi_block_addr_t chunk_address;
 		struct scsi_task *task = command_data;
 		struct chunk_st *chunk = private_data;
 
 		assert(task != NULL);
 		assert(chunk != NULL);
+		assert(chunk->task == task);
 
-#ifdef LIBISCSI_API_VERSION
-		task->ptr = scsi_cdb_unmarshall(task, SCSI_OPCODE_READ10);
-#endif
-		assert(LBA_OF(task) == chunk->address);
-
-		assert(chunk->address >= first);
-		assert(chunk->address < input.until);
+		SET_TASK_PTR(task, SCSI_OPCODE_READ10);
+		chunk_address = LBA_OF(task);
+		assert(chunk_address >= first);
+		assert(chunk_address < input.until);
 
 		assert(chunk->input->nreqs > 0);
 		chunk->input->nreqs--;
 
+		if (status == SCSI_STATUS_CANCELLED)
+		{
+			task->status = status;
+			return;
+		}
+
 		offset = target->position % target->endp.blocksize;
 		if (fatal)
-			/* Failed @fatal:ly earlier, don't do anything. */;
+			/* Failed $fatal:ly earlier, don't do anything. */;
 		else if (is_iscsi_error(iscsi, task, "read10", status))
 		{	/* Re-read the chunk. */
-			scsi_free_scsi_task(task);
 			chunk_failed(chunk);
 			return;
-		} else if (chunk->address > first)
-		{	/* $first < $chunk->address < $first + $nblocks */
+		} else if (chunk_address > first)
+		{	/* $first < $chunk_address < $first + $nblocks */
 			/* This chunk possibly includes the last block. */
-			/* $offset := where to copy in @buf */
+			/* $offset := where to copy in $buf */
 			offset  = target->endp.blocksize - offset;
-			offset += (chunk->address - first - 1)
+			offset += (chunk_address - first - 1)
 				* target->endp.blocksize;
 
 			/*
@@ -980,7 +987,7 @@ ssize_t read(int fd, void *buf, size_t sbuf)
 		} else if (task->datain.size > offset)
 		{	/* First block, we may not need the first $offset
 			 * bytes of the returned data. */
-			assert(chunk->address == first);
+			assert(chunk_address == first);
 
 			/* $n := the number of bytes to copy */
 			assert(offset < task->datain.size);
@@ -994,7 +1001,9 @@ ssize_t read(int fd, void *buf, size_t sbuf)
 			 * so let's consider this a $fatal error. */
 			fatal = 1;
 
+		chunk->time_to_retry = 0;
 		scsi_free_scsi_task(task);
+		chunk->task = NULL;
 		return_chunk(chunk);
 	} /* read_cb */
 
@@ -1065,40 +1074,41 @@ ssize_t write(int fd, void const *buf, size_t sbuf)
 	void read_cb(struct iscsi_context *iscsi, int status,
 		void *command_data, void *private_data)
 	{
+		scsi_block_addr_t chunk_address;
 		struct scsi_task *task = command_data;
 		struct chunk_st *chunk = private_data;
 
 		assert(task != NULL);
 		assert(chunk != NULL);
+		assert(chunk->task == task);
 
-#ifdef LIBISCSI_API_VERSION
-		/* See chunk_read() in sexycat.c. */
-		task->ptr = scsi_cdb_unmarshall(task, SCSI_OPCODE_READ10);
-#endif
-
-		assert(chunk->address == LBA_OF(task));
-		assert(chunk->address >= from);
-		assert(chunk->address < input.until);
+		SET_TASK_PTR(task, SCSI_OPCODE_READ10);
+		chunk_address = LBA_OF(task);
+		assert(chunk_address >= from);
+		assert(chunk_address < input.until);
 		assert(task->datain.size > 0);
 		assert(task->datain.size % blocksize == 0);
 
 		assert(chunk->input->nreqs > 0);
 		chunk->input->nreqs--;
 
-		if (is_iscsi_error(iscsi, task, "read10", status))
+		if (status == SCSI_STATUS_CANCELLED)
 		{
-			scsi_free_scsi_task(task);
+			task->status = status;
+			return;
+		} else if (is_iscsi_error(iscsi, task, "read10", status))
+		{
 			chunk_failed(chunk);
 			return;
 		}
 
 		/* Is it the $first or $last chunk? */
-		if (chunk->address == from)
+		if (chunk_address == from)
 		{	/* We'll write the head and possibly
 			 * the tail of $buf to $first. */
 			assert(!first);
 			first = task;
-		} else if (input.until - chunk->address
+		} else if (input.until - chunk_address
 			<= task->datain.size / blocksize)
 		{	/* $address + $nblocks >= $until.
 			 * We'll write the tail of $buf to $last. */
@@ -1107,6 +1117,8 @@ ssize_t write(int fd, void const *buf, size_t sbuf)
 		} else	/* Not interested in this chunk. */
 			scsi_free_scsi_task(task);
 
+		chunk->time_to_retry = 0;
+		chunk->task = NULL;
 		return_chunk(chunk);
 	} /* read_cb */
 

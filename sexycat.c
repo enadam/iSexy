@@ -44,64 +44,89 @@
  *   -I <dst-initiator-name>	Log in to the destination iSCSI target with
  *				this IQN.  If left unspecified the source's
  *				initiator name is used.  Otherwise if the
- *				argument is an empty string the same hardeced
+ *				argument is an empty string the same hardcoded
  *				default is used as for <src-initiator-name>.
  *				Ignored if the destination is a local file.
+ *   -rR			Reserve the entire source/destination target's
+ *				LUN when connecting.  Might be useful if you
+ *				get RESERVATION CONFLICT errors.  Ignored if
+ *				the target is local.  Not available if compiled
+ *				with libiscsi 1.4.
  *   -N				Don't do any I/O, just connect to the iSCSI
  *				device(s) and log in and print the capacity
  *				of the iSCSI target(s).
- *   -O				Overwrite the local destination <file-name>.
- *   -V				Before starting downloading ensure that the
+ *   -f				Before starting downloading ensure that the
  *				necessary free disk space is available.
+ *   -F				Overwrite the local destination <file-name>.
  *   -v				Be more verbose:
  *				-- at level 2 it's printed when a block is
  *				   being re-read or rewritten due to a fault
  *				The default level is 1.
  *   -q				Be less verbose.  At verbosity level 0 all
  *				informational output is suppressed.
+ *   -V				Timestamp error messages.
  *   -p {<secs>|<millissecs>ms}	Report progress (block number being read,
  *				last block that has been read and written)
  *				every so often.  If no progress was made
  *				since the last time it had been reported,
  *				it's suppressed, unles 10 * <seconds> have
  *				passed.
- *   -fF <fallback-blocksize>	If the iSCSI target's block size cannot be
- *				determined, suppose the given value instead
- *				of the default 512 bytes.  -F only sets the
- *				destination target's, -f sets it for both.
+ *   -cC {<chunk-size>[mMkKbB]|<fraction>|<percentage>%}
+ *   				Read/write <chunk-size> mega/kilo/bytes or
+ *				blocks of data at once if possible.  If not
+ *				specified the server is queried for its
+ *				preference.  You can instruct the use of
+ *				a <fraction> between 0..1 or a <percentage>
+ *				of that.  -C only sets the destination's
+ *				<chunk-size>, -c sets it for both targets.
  *				If you only want to set it for the source,
- *				specify -F 0 explicitly after -f.
- *   -cC <chunk-size>		Read/write <chunk-size> blocks of data at once
- *				if possible.  If not specified the server is
- *				queried for its preference.  -c and -C are in
- *				the same relation as -f and -F.
+ *				specify -C 0 explicitly after -c.
  *   -mM <max-reqs>		The maximum number of parallel requests
  *				to iSCSI targets.  If the connection breaks,
  *				this number is reduced by the factor which
- *				can be specified with -R.  Ignored when
+ *				can be specified with -Q.  Ignored when
  *				the endpoint is a local file, otherwise
- *				the default is 32.  -m and -M are in the
- *				same relation as -f and -F.
+ *				the default is 32.  -mM behave similarly
+ *				as -cC.
  *   -b <min-output-batch>	Collect at least this number of input chunks
  *				before writing them out.  Writing of larger
  *				batches can be more efficient.  Only effective
- *				if the destination is a local file, otherwise
+ *				if the destination is a local file, and then
  *				the default is 32.
  *   -B <max-output-batch>	Write the output batch if this many input
  *				chunks has been collected.  Only effective
- *				if the destination is a local file, otherwise
+ *				if the destination is a local file, and then
  *				the default is 64.
- *   -r <retry-delay>		If reading or writing a chunk is failed,
+ *   -t <retry-delay>		If reading or writing a chunk is failed
+ *				(the server returns an error response)
  *				wait <retry-delay> milliseconds before
  *				retrying.  The default is three seconds.
- *   -R <degradation-percent>	When the connection breaks with an iSCSI
- *				device it's supposed to be caused by the
- *				too high amount of parallel iSCSI requests
- *				(at least this is the case with istgt).
- *				This case the maximimum number of requests
- *				(which can be specified with -mM) is reduced
+ *   -T <request-timeout>	Consider a read/write iSCSI request timed out
+ *				after this many milliseconds (30s by default).
+ *				Then the request retried immedeately.
+ *   -H <pause-between-attempts>[x<max-attempts>]
+ *				When the connection breaks with a target,
+ *				sexycat tries to reconnect, and without
+ *				this flag gives up if it's unsuccessful.
+ *				Otherwise it makes <max-attempts> altogether,
+ *				pausing inbetween <pause-between-attempts>
+ *				seconds.  If <max-attempts> is zero, sexycat
+ *				persists until connection could be established
+ *				and the server allowed to Login.
+ *   -Q <degradation-percent>	When the connection breaks with an iSCSI
+ *				target it can be because sexycat issued
+ *				too many requests in parallel (at least
+ *				this is the case with istgt).  This case
+ *				the maximimum number of requests (which
+ *				can be specified with -mM) can be reduced
  *				to this percent.  The value must be between
- *				0..100, and the default is 50%.
+ *				0..100.  0/100 mean not to do this reduction
+ *				and this is the default.
+ *   -zZ <fallback-blocksize>	If the iSCSI target's block size cannot be
+ *				determined, suppose the given value instead
+ *				of the default 512 bytes.  This is intended
+ *				as a very-last-resort measure.  -zZ behave
+ *				similarly as -cC.
  *
  * <iscsi-url> is iscsi://<host>[:<port>]/<target-name>/<LUN>.
  * <host> can either be a hostname or an IPv4 or IPv6 address.
@@ -123,7 +148,6 @@
  * TODO output: seek
  * TODO end-to-end checksum
  * TODO checksum per every nth block/chunk
- * TODO request timeout (don't trust the server)
  * TODO remote_to_local: force non-seekable
  * TODO use readcapacity16 et al.
  * TODO full documentation
@@ -150,7 +174,7 @@
 #endif
 
 /* If we're not built as a part of sexywrap, we're building sexycat. */
-#ifndef SEXYWRAP
+#if !defined(SEXYCAT) && !defined(SEXYWRAP)
 # define SEXYCAT
 #endif
 
@@ -160,6 +184,7 @@
 
 /* Include files {{{ */
 #include <stdlib.h>
+#include <limits.h>
 #include <unistd.h>
 #include <stdarg.h>
 #include <errno.h>
@@ -167,13 +192,16 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
 #include <time.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <setjmp.h>
 
 #include <sys/stat.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/uio.h>
 #include <sys/statvfs.h>
 
@@ -189,19 +217,25 @@
 #define DFLT_INITIAL_MAX_OUTPUT_QUEUE	(DFLT_INITIAL_MAX_ISCSI_REQS * 2)
 #define DFLT_MIN_OUTPUT_BATCH		(DFLT_INITIAL_MAX_OUTPUT_QUEUE / 2)
 
-#define DFLT_ISCSI_MAXREQS_DEGRADATION	50
-#define DFLT_ISCSI_REQUEST_RETRY_PAUSE	(3 * 1000)
+#define DFLT_ISCSI_REQUEST_TIMEOUT	(30 * 1000)
+#define DFLT_ISCSI_REQUEST_RETRY_PAUSE	( 3 * 1000)
 /* }}} */
 
 /* Macros {{{ */
 /* Return the number of elements in $ary. */
-#define MEMBS_OF(ary)			(sizeof(ary) / sizeof((ary)[0]))
+#define MEMBS_OF(ary)	(sizeof(ary) / sizeof((ary)[0]))
 
 /* Shortcuts */
 #ifdef LIBISCSI_API_VERSION
-# define LBA_OF(task)			(((struct scsi_read10_cdb const *)((task)->ptr))->lba)
+  /* This is necessary for LBA_OF() to work. */
+# define SET_TASK_PTR(task, op)	(task)->ptr = scsi_cdb_unmarshall((task), op)
+
+  /* We assume that offsetof(scsi_read10_cdb, lba) == that of write10. */
+# define LBA_OF(task)	(((struct scsi_read10_cdb const *)((task)->ptr))->lba)
 #else /* libiscsi 1.4 */
-# define LBA_OF(task)			((task)->params.read10.lba)
+# define SET_TASK_PTR(task, op)	/* NOP */
+# define LBA_OF(task)		((task)->params.read10.lba)
+# define iscsi_scsi_cancel_task	iscsi_scsi_task_cancel
 #endif
 
 /*
@@ -273,6 +307,9 @@ struct endpoint_st
 
 			/* The $initiator name to use for log in to $url. */
 			char const *initiator;
+
+			/* reserve6 the LUN? */
+			int reserve;
 		};
 	};
 
@@ -335,48 +372,51 @@ struct endpoint_st
 struct input_st;
 struct chunk_st
 {
-	/* If the chunk is unused (not reading or writing), points to the
-	 * next chunk in the input_st::unused chain. */
-	struct chunk_st *next;
+	/* The chunk can be in input_st::unused chain ($prev is NULL),
+	 * in the ::in_use chain or being transferred from one to the
+	 * other (ie. it's "floating"; both $prev and $next are NULL). */
+	struct chunk_st *prev, *next;
 
 	/* All chunks link to the same input_st. */
 	struct input_st *input;
 
-	/* Starting address of the block(s) being read or written
-	 * in this chunk. */
-	scsi_block_addr_t address;
+	/*
+	 * The read/write task being carried out or waiting to be carried
+	 * out with this chunk.  The operation is encoded in $task->xfer_dir
+	 * and the status (in progress or failed, waiting for reply or retry)
+	 * in $task->status.  NULL if the chunk is unused.
+	 *
+	 * It's important that $task->ptr be set to the unmarshalled response
+	 * with SET_TASK_PTR() in the callback, otherwise LBA_OF() won't work.
+	 */
+	struct scsi_task *task;
 
-	/* If the chunk is failed, the number of milliseconds until retry.
-	 * This is recalculated by restart_requests().  Zero for unused
-	 * chunks. */
+	/* Time in milliseconds until the request is retried, either because
+	 * of no reply or the time after a failure has elapsed.  Zero if the
+	 * chunk is unused.  Recalculated by xfpoll(). */
 	unsigned time_to_retry;
 
-	/* The data carried by this chunk. */
+	/* The size of buffer referred by the pointers below. */
+	size_t sbuf;
+
+	/* The payload carried by this chunk.  NULL if the chunk is unused. */
 	union
 	{
-		/* Created by libiscsi and used by remote_to_local()
-		 * and remote_to_remote(). */
-		struct scsi_task *read_task;
-
 		struct
 		{
-			/* The size of buffer referred by $rbuf or $wbuf.
-			 * For $read_task, this information is contained
-			 * therein. */
-			size_t sbuf;
+			/* Used by sexywrap and points to a separately and
+			 * possibly user-allocated buffer, so it must not
+			 * be free()d. */
+			void const *wrpbuf;
 
-			union
-			{
-				/* Used by sexywrap and points to
-				 * a separately allocated buffer. */
-				void const *wbuf;
+			/* Used by remote_to_remote() and points to the
+			 * payload read from the source target. */
+			void *rtrbuf;
+		} s;
 
-				/* Used by local_to_remote() and designates
-				 * the beginning of the buffer allocated
-				 * together with the containing chunk_st. */
-				unsigned char rbuf[0];
-			} u;
-		};
+		/* Used by local_to_remote() and designates the beginning
+		 * of the buffer allocated together with the chunk_st. */
+		unsigned char ltrbuf[0];
 	};
 };
 
@@ -387,8 +427,7 @@ struct output_st
 {
 	union
 	{
-		/* The number of outstanding write requests.  Zero if the
-		 * destination is local. */
+		/* The number of outstanding write requests. */
 		unsigned nreqs;
 
 		/* These are only used for local destination.  This case
@@ -438,14 +477,15 @@ struct input_st
 	 * $nunused is the number of chunks in the list; it's only used
 	 * by free_surplus_unused_chunks().
 	 *
-	 * $failed is a list of chunks whose reading _or_ writing failed
-	 * and needs to be retried.  $last_failed points to the last
-	 * element of the list; it's only used by chunk_failed() in order
-	 * to be able to append a new chunk to the end of of list quickly.
+	 * All other chunks are $in_use, except those which are floating
+	 * a little before added to the list or returned to the $unused
+	 * list because of an error.  Chunks $in_use are either waiting
+	 * for reply to a request or are waiting for chunk_st::time_to_retry
+	 * to elapse and be retried.  $last_in_use is for enqueue_chunk().
 	 */
 	unsigned nunused;
 	struct chunk_st *unused;
-	struct chunk_st *failed, *last_failed;
+	struct chunk_st *in_use, *last_in_use;
 
 	/* Links to all other structures. */
 	struct output_st *output;
@@ -454,6 +494,11 @@ struct input_st
 /* }}} */
 
 /* Function prototypes {{{ */
+static unsigned timediff(
+	struct timespec const *later,
+	struct timespec const *earlier);
+static char const *timestamp(unsigned ms);
+
 static void __attribute__((noreturn)) usage(void);
 static void warnv(char const *fmt, va_list *args);
 static void __attribute__((format(printf, 1, 2)))
@@ -465,15 +510,14 @@ static void __attribute__((nonnull(2)))
 static void __attribute__((noreturn, format(printf, 1, 2)))
 	die(char const *fmt, ...);
 
-static int get_inode(int fd, ino_t *inodep);
-static unsigned timediff(
-	struct timespec const *later,
-	struct timespec const *earlier);
-static void report_progress(void);
-
 static void *__attribute__((malloc)) xmalloc(size_t size);
 static void xrealloc(void *ptrp, size_t size);
-static int xpoll(struct pollfd *pfd, unsigned npolls);
+
+static int get_inode(int fd, ino_t *inodep);
+static void start_timer(unsigned ms);
+static void stop_timer(void);
+static void report_progress(int unused);
+
 static int xfpoll(struct pollfd *pfd,unsigned npolls,struct input_st *input);
 static int xread(int fd, unsigned char *buf, size_t sbuf, size_t *nreadp);
 static int xpwritev(int fd, struct iovec *iov, unsigned niov,
@@ -501,6 +545,7 @@ static void chunk_written(struct iscsi_context *iscsi, int status,
 	void *command_data, void *private_data);
 static void chunk_read(struct iscsi_context *iscsi, int status,
 	void *command_data, void *private_data);
+static enum scsi_xfer_dir chunk_dir(struct chunk_st const *chunk);
 static size_t read_chunk_size(
 	struct endpoint_st const *src, struct endpoint_st const *dst,
 	scsi_block_addr_t from, scsi_block_addr_t until);
@@ -513,8 +558,12 @@ static void free_chunks(struct chunk_st *chunk);
 static void free_surplus_unused_chunks(struct input_st *input);
 static void reduce_maxreqs(struct endpoint_st *endp);
 static void return_chunk(struct chunk_st *chunk);
-static void take_chunk(struct chunk_st *chunk);
+static void enqueue_chunk(struct chunk_st *chunk,
+	int status, unsigned timeout);
+static void retry_chunk(struct chunk_st *chunk);
 static void chunk_failed(struct chunk_st *chunk);
+static void chunk_started(struct chunk_st *chunk);
+static struct chunk_st *get_chunk(struct input_st *input);
 
 static void done_input(struct input_st *input);
 static int init_input(struct input_st *input, struct output_st *output,
@@ -522,8 +571,8 @@ static int init_input(struct input_st *input, struct output_st *output,
 
 static void endpoint_connected(struct iscsi_context *iscsi, int status,
 	void *command_data, void *private_data);
-static int connect_endpoint(struct iscsi_context *iscsi,
-	struct iscsi_url *url);
+static int connect_endpoint(
+	struct iscsi_context *iscsi, struct iscsi_url *url, int reserve);
 static int reconnect_endpoint(struct endpoint_st *endp);
 
 static struct scsi_task *read_endpoint(struct endpoint_st const *endp,
@@ -535,8 +584,10 @@ static struct scsi_task *write_endpoint(struct endpoint_st const *endp,
 
 static void destroy_endpoint(struct endpoint_st *endp);
 static void print_endpoint(struct endpoint_st const *endp);
+static void set_endpoint_desired_optimum(struct endpoint_st *endp,
+	char const *str);
 static void calibrate_endpoint(struct endpoint_st *endp,
-	scsi_block_count_t desired_optimum);
+	char const *desired_optimum);
 static int stat_endpoint(struct endpoint_st *endp,
 	unsigned fallback_blocksize);
 static int init_endpoint(struct endpoint_st *endp, char const *url,
@@ -554,9 +605,9 @@ static int remote_to_remote(struct input_st *input);
 
 /* Private variables {{{ */
 /* User controls {{{ */
-/* -vqp */
+/* -Vvqp */
 /* By default $Opt_verbosity is 1.  $Opt_progress is in milliseconds. */
-static int Opt_verbosity, Opt_progress;
+static int Opt_timestamp, Opt_verbosity, Opt_progress;
 
 /* -bB */
 #ifdef SEXYCAT
@@ -564,9 +615,16 @@ static unsigned Opt_min_output_batch = DFLT_MIN_OUTPUT_BATCH;
 static unsigned Opt_max_output_queue = DFLT_INITIAL_MAX_OUTPUT_QUEUE;
 #endif
 
-/* -rR */
+/* -HtTQ */
+static struct
+{
+	int enabled;
+	unsigned pause;
+	unsigned ntimes;
+} Opt_retry_connection;;
+static unsigned Opt_request_timeout	= DFLT_ISCSI_REQUEST_TIMEOUT;
 static unsigned Opt_request_retry_time  = DFLT_ISCSI_REQUEST_RETRY_PAUSE;
-static unsigned Opt_maxreqs_degradation = DFLT_ISCSI_MAXREQS_DEGRADATION;
+static unsigned Opt_maxreqs_degradation;
 /* }}} */
 
 /*
@@ -580,43 +638,98 @@ static __attribute__((unused)) FILE *Info;
 
 /*
  * -- $Start: when the program was started; used by report_progress()
- *    to show the timestamp
- * -- $Last_report: the last time report_progress() printed something
- * -- $Now: the current time after the invocation of xfpoll()
- *
- * All of these times are from clock_gettime().  $Last_report and $Now
- * are used by report_progress() to decide whether it's time to wake up.
- * $Now is also used by xfpoll() to maintain the retry timers of chunks.
+ * -- $Now: the current time; used by report_progress() and xfpoll()
+ * Both are acquired with clock_gettime().
  */
-static struct timespec Start, Last_report, Now;
+static struct timespec Start, Now;
 
-/*
- * The latest blocks being/having been read/written.  $Last values are
- * updated by start_iscsi_read_requests() ($reading), chunk_read() ($red),
- * and chunk_written() ($written).  $Prev:ious reported values are saved
- * in order report_progress() not to repeat itself too often.
- */
-static struct
+/* The latest blocks being or having been read or written. */
+static struct progress_st
 {
-	scsi_block_addr_t reading, red;
-	scsi_block_addr_t writing, written;
-} Prev, Last;
+	scsi_block_addr_t reading;	/* Updated by
+					 * start_iscsi_read_requests(). */
+	scsi_block_addr_t red;		/* Updated by chunk_read(). */
+	scsi_block_addr_t writing;	/* Updated by add_output_chunk(),
+					 * chunk_read(), local_to_remote(). */
+	scsi_block_addr_t written;	/* Updated by  chunk_written()
+					 * and process_output_queue(). */
+} Last;
 /* }}} */
 
 /* Program code */
+/* Return $later - $earlier in ms.  It is assumed that $later >= $earlier. */
+unsigned timediff(struct timespec const *later,
+	struct timespec const *earlier)
+{
+	const unsigned ms_per_sec = 1000;
+	const long ns_per_ms = 1000000;
+	unsigned diff;
+
+	/* Verify the precondition. */
+	assert(earlier->tv_sec || earlier->tv_nsec);
+	if (later->tv_sec != earlier->tv_sec)
+		assert(later->tv_sec > earlier->tv_sec);
+	else 
+		assert(later->tv_nsec >= earlier->tv_nsec);
+
+	diff  = (later->tv_sec  - earlier->tv_sec)  * ms_per_sec;
+	diff += (later->tv_nsec - earlier->tv_nsec) / ns_per_ms;
+
+	return diff;
+} /* timediff */
+
+char const *timestamp(unsigned ms)
+{
+#ifdef SEXYCAT
+	static char str[32];
+	unsigned hours, mins, secs;
+	int serrno;
+
+	if (!Start.tv_sec && !Start.tv_nsec)
+		/* Called by sexywrap, no timestampts. */
+		return "";
+	if (!ms && !Opt_timestamp)
+		/* -V wasn't specified */
+		return "";
+
+	serrno = errno;
+	if (!ms)
+	{
+		struct timespec now;
+
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		ms = timediff(&now, &Start);
+	}
+
+	ms /= 1000;
+	hours = ms / (60*60);
+	ms %= 60*60;
+	mins = ms / 60;
+	secs = ms % 60;
+
+	sprintf(str, "[%.2u:%.2u:%.2u]", hours, mins, secs);
+
+	errno = serrno;
+	return str;
+#else	/* ! SEXYCAT */
+	return "";
+#endif
+}
+
 void usage(void)
 {
 	printf("usage: %s [-vq] [-p <progress>] "
-		"[-fF <fallback-blocksize>] "
 		"[-cC <chunk-size>] "
 		"[-mM <max-requests> "
-		"[-r <retry-pause>] [-R <request-degradation>] "
+		"[-t <retry-pause>] [-T <request-timeout>] "
+		"[-H <reconnection-pause>[x<max-attempts>] "
+		"[-Q <request-degradation>] [-zZ <fallback-blocksize>] "
 		"[-bB <batch-size>] "
-		"[-i <initiator>] [-N] "
+		"[-iI <initiator>] [-rR] [-N] "
 #ifdef SEXYWRAP
 		"[-x <program> [<args>...]] "
 #endif
-		"[-sS <source>] [-OV] [-dD <destination>]\n",
+		"[-sS <source>] [-fF] [-dD <destination>]\n",
 		Basename);
 	exit(0);
 }
@@ -636,7 +749,7 @@ void warnv(char const *fmt, va_list *args)
 	if (Info && Info != stderr)
 		fflush(Info);
 
-	fprintf(stderr, "%s: ", Basename);
+	fprintf(stderr, "%s%s: ", Basename, timestamp(0));
 	vfprintf(stderr, fmt, *args);
 	putc('\n', stderr);
 }
@@ -658,7 +771,7 @@ void warn_errno(char const *op)
 #endif
 	if (Info && Info != stderr)
 		fflush(Info);
-	fprintf(stderr, "%s: %s: %m\n", Basename, op);
+	fprintf(stderr, "%s%s: %s: %m\n", Basename, timestamp(0), op);
 }
 
 void warn_iscsi(char const *op, struct iscsi_context *iscsi)
@@ -670,10 +783,12 @@ void warn_iscsi(char const *op, struct iscsi_context *iscsi)
 	if (Info && Info != stderr)
 		fflush(Info);
 	if (op)
-		fprintf(stderr, "%s: %s: %s\n", Basename, op,
+		fprintf(stderr, "%s%s: %s: %s\n",
+			Basename, timestamp(0), op,
 			iscsi_get_error(iscsi));
 	else
-		fprintf(stderr, "%s: %s\n", Basename,
+		fprintf(stderr, "%s%s: %s\n",
+			Basename, timestamp(0),
 			iscsi_get_error(iscsi));
 }
 
@@ -690,6 +805,28 @@ void die(char const *fmt, ...)
 
 	exit(1);
 }
+
+#ifdef SEXYCAT
+void *xmalloc(size_t size)
+{
+	void *ptr;
+
+	if (!(ptr = malloc(size)))
+		die("malloc(%zu): %m", size);
+
+	return ptr;
+}
+
+void xrealloc(void *ptrp, size_t size)
+{
+	void *ptr;
+
+	ptr = *(void **)ptrp;
+	if (!(ptr = realloc(ptr, size)))
+		die("realloc(%zu): %m", size);
+	*(void **)ptrp = ptr;
+}
+#endif /* SEXYCAT */
 
 /*
  * Return the i-node number of $fd.  If *$inodep != 0 and it differs from
@@ -718,161 +855,154 @@ int get_inode(int fd, ino_t *inodep)
 		return 0;
 } /* get_inode */
 
-/* Return $later - $earlier in ms.  It is assumed that $later >= $earlier. */
-unsigned timediff(struct timespec const *later,
-	struct timespec const *earlier)
+#ifdef SEXYCAT
+void start_timer(unsigned ms)
 {
-	const unsigned ms_per_sec = 1000;
-	const long ns_per_ms = 1000000;
-	unsigned diff;
+	struct itimerval it;
 
-	/* Verify the precondition. */
-	if (later->tv_sec != earlier->tv_sec)
-		assert(later->tv_sec > earlier->tv_sec);
-	else 
-		assert(later->tv_nsec >= earlier->tv_nsec);
+	memset(&it, 0, sizeof(it));
+	it.it_value.tv_sec  =  ms / 1000;
+	it.it_value.tv_usec = (ms % 1000) * 1000;
+	it.it_interval = it.it_value;
+	setitimer(ITIMER_REAL, &it, NULL);
+}
 
-	diff  = (later->tv_sec  - earlier->tv_sec)  * ms_per_sec;
-	diff += (later->tv_nsec - earlier->tv_nsec) / ns_per_ms;
+void stop_timer(void)
+{
+	struct itimerval it;
 
-	return diff;
-} /* timediff */
+	memset(&it, 0, sizeof(it));
+	setitimer(ITIMER_REAL, &it, NULL);
+}
 
 /* Print $Last if $Opt_progress has passed since the previous report.
- * Called by xpoll() and xfpoll(). */
-void report_progress(void)
+ * Invoked by SIGALRM. */
+void report_progress(int unused)
 {
-#ifdef SEXYCAT
-	unsigned diff, hours, mins, secs;
+	static struct timespec last_report;
+	static struct progress_st prev;
+	unsigned diff;
 
-	if (!Opt_progress)
-		return;
-	if (!Start.tv_sec && !Start.tv_nsec)
-		return;
-
-	assert(Now.tv_sec || Now.tv_nsec);
-	diff = timediff(&Now, Last_report.tv_sec || Last_report.tv_nsec
-		? &Last_report : &Start);
+	clock_gettime(CLOCK_MONOTONIC, &Now);
+	diff = timediff(&Now, last_report.tv_sec || last_report.tv_nsec
+		? &last_report : &Start);
 	if (diff < Opt_progress)
 		/* $Opt_progress hasn't passed since $Last_report. */
 		return;
 	if (diff < 10 * Opt_progress
-			&& Last.reading == Prev.reading
-			&& Last.red == Prev.red
-			&& Last.written == Prev.written)
+			&& Last.reading == prev.reading
+			&& Last.red     == prev.red
+			&& Last.writing == prev.written
+			&& Last.written == prev.written)
 		/* $Opt_progress has passed, but the values didn't change,
 		 * don't report unless 10*$Opt_progress has passed. */
 		return;
 
 	/* $diff := $Now - $Start.  Don't recalculate it if we used
 	 * $Start earlier. */
-	if (Last_report.tv_sec || Last_report.tv_nsec)
+	if (last_report.tv_sec || last_report.tv_nsec)
 		diff = timediff(&Now, &Start);
 
-	/* $diff -> $hours:$mins:$secs */
-	diff /= 1000;
-	hours = diff / (60*60);
-	diff %= 60*60;
-	mins = diff / 60;
-	secs = diff % 60;
-
-	info("[%.2u:%.2u:%.2u] "
-	     	"reading #%u, have read #%u, writing #%u, written #%u",
-		hours, mins, secs,
+	info("%s reading #%u, have read #%u, writing #%u, written #%u",
+		timestamp(diff),
 		Last.reading, Last.red, Last.writing, Last.written);
-	Prev = Last;
-	Last_report = Now;
-#endif /* SEXYCAT */
+
+	prev = Last;
+	last_report = Now;
 } /* report_progress */
-
-#ifdef SEXYCAT
-void *xmalloc(size_t size)
-{
-	void *ptr;
-
-	if (!(ptr = malloc(size)))
-		die("malloc(%zu): %m", size);
-
-	return ptr;
-}
-
-void xrealloc(void *ptrp, size_t size)
-{
-	void *ptr;
-
-	ptr = *(void **)ptrp;
-	if (!(ptr = realloc(ptr, size)))
-		die("realloc(%zu): %m", size);
-	*(void **)ptrp = ptr;
-}
 #endif /* SEXYCAT */
 
 /* On failure $errno is set. */
-int xpoll(struct pollfd *pfd, unsigned npolls)
-{
-	int ret;
-
-	for (;;)
-	{	/* Sleep at most $Opt_progress if progress reporting
-		 * is enabled. */
-		if (Opt_progress)
-		{
-			ret = poll(pfd, npolls, Opt_progress);
-			clock_gettime(CLOCK_MONOTONIC, &Now);
-			report_progress();
-		} else	/* We can sleep indefinitely long. */
-			ret = poll(pfd, npolls, -1);
-		if (ret > 0)
-			return ret;
-		if (ret < 0 && errno != EINTR)
-			return 0;
-	} /* while EINTR */
-}
-
-/* As a side-effect $Now is updated.  On failure $errno is set. */
 int xfpoll(struct pollfd *pfd, unsigned npolls, struct input_st *input)
 {
-	int ret, eintr;
-
-	/* If we don't have failed chunks we can wait indefinitely
-	 * and we won't have to update any chunk_st::time_to_retry:es. */
-	if (!input->failed)
-		return xpoll(pfd, npolls) ? 1 : -1;
-
 	/* poll() as long as it returns EINTR. */
-	do
+	memset(&Now, 0, sizeof(Now));
+	for (;;)
 	{
+		int ret, serrno;
 		struct timespec since;
-		struct chunk_st *chunk;
 		unsigned timeout, elapsed;
 
-		/*
-		 * Measure the time since we were called last time.
-		 * Sleep at most $timeout milliseconds, which is either
-		 * the expiration of the oldest failed chunk, or the
-		 * time to the next progress report.
-		 */
-		since = Now.tv_sec || Now.tv_nsec ? Now : Start;
-		timeout = input->failed->time_to_retry;
-		if (Opt_progress && timeout > Opt_progress)
-			timeout = Opt_progress;
-		ret = poll(pfd, npolls, timeout);
-		eintr = ret < 0 && errno == EINTR;
+		/* Sleep at most as much as the oldest $chunk $in_use. */
+		if (input)
+		{
+			struct chunk_st *chunk;
 
-		/* Get the $elapsed time $since. */
-		clock_gettime(CLOCK_MONOTONIC, &Now);
+			timeout = 0;
+			for (chunk = input->in_use; ; chunk = chunk->next)
+			{
+				if (!chunk)
+					break;
+				else if (chunk_dir(chunk) == SCSI_XFER_NONE)
+					continue;
+				else if (!chunk->time_to_retry)
+					return 0;
+				else if (!timeout)
+					timeout = chunk->time_to_retry;
+				else if (timeout > chunk->time_to_retry)
+					timeout = chunk->time_to_retry;
+				break;
+			} /* for all $failed $chunk */
+		} else	/* Called by connect_endpoint(), wait for Login. */
+			timeout = Opt_request_timeout;
+
+		/* Measure the time [p]poll() takes. */
+		if (Now.tv_sec || Now.tv_nsec)
+		{	/* We know $Now from the previous iteration. */
+			since = Now;
+			memset(&Now, 0, sizeof(Now));
+		} else
+			clock_gettime(CLOCK_MONOTONIC, &since);
+
+		/* Poll $pfd. */
+		if (input && Opt_progress)
+		{
+			sigset_t empty;
+
+			/* Unblock SIGALRM (report_progress()). */
+			sigemptyset(&empty);
+			if (timeout > 0)
+			{
+				struct timespec ts;
+
+				memset(&ts, 0, sizeof(ts));
+				ts.tv_sec  =  timeout / 1000;
+				ts.tv_nsec = (timeout % 1000) * 1000000;
+				ret = ppoll(pfd, npolls, &ts,  &empty);
+			} else
+				ret = ppoll(pfd, npolls, NULL, &empty);
+		} else	/* connect_endpoint() || !report_progress() */
+			ret = poll(pfd, npolls, timeout ? timeout : -1);
+		serrno = errno;
+
+		/* Get the $elapsed time $since.
+		 * report_progress() might have set $Now. */
+		if (!Now.tv_sec && !Now.tv_nsec)
+			clock_gettime(CLOCK_MONOTONIC, &Now);
 		elapsed = timediff(&Now, &since);
-		report_progress();
 
-		/* Subtract the elapsed time from all failed chunks. */
-		for (chunk = input->failed; chunk; chunk = chunk->next)
-			if (chunk->time_to_retry > elapsed)
-				chunk->time_to_retry -= elapsed;
-			else
-				chunk->time_to_retry = 0;
-	} while (eintr);
+		/* Subtract the $elapsed time from all chunks $in_use. */
+		if (input && elapsed)
+		{
+			struct chunk_st *chunk;
 
-	return ret;
+			for (chunk = input->in_use; chunk;
+					chunk = chunk->next)
+				if (chunk->time_to_retry > elapsed)
+					chunk->time_to_retry -= elapsed;
+				else
+					chunk->time_to_retry = 0;
+		}
+
+		if (ret < 0)
+		{
+			if (serrno == EINTR)
+				continue;
+			errno = serrno;
+		}
+		if (ret != 0 || !input)
+			return ret;
+	} /* until there's something to (re-)read/write or time runs out */
 }
 
 #ifdef SEXYCAT
@@ -917,14 +1047,15 @@ int xpwritev(int fd, struct iovec *iov, unsigned niov, off_t offset, int seek)
 	{
 		int ret;
 
-		ret = seek
-			? niov > 1
+		if (niov > 1)
+			ret = seek
 				? pwritev(fd, iov, niov, offset)
-				: pwrite(fd, iov[0].iov_base, iov[0].iov_len,
+				:  writev(fd, iov, niov);
+		else
+			ret = seek
+				? pwrite(fd, iov[0].iov_base, iov[0].iov_len,
 					offset)
-			: niov > 1
-				? writev(fd, iov, niov)
-				: write(fd, iov[0].iov_base, iov[0].iov_len);
+				:  write(fd, iov[0].iov_base, iov[0].iov_len);
 		if (ret < 0)
 		{
 			if (errno != EAGAIN && errno != EINTR
@@ -987,8 +1118,9 @@ int is_iscsi_error(struct iscsi_context *iscsi, struct scsi_task *task,
 	if (status == SCSI_STATUS_GOOD)
 		return 0;
 	else if (status == SCSI_STATUS_CHECK_CONDITION)
-		warn("%s: sense key:%d ascq:%04x",
-			op, task->sense.key, task->sense.ascq);
+		warn("%s(#%u): sense key:%d ascq:%04x",
+			op, LBA_OF(task),
+			task->sense.key, task->sense.ascq);
 	else if (status != SCSI_STATUS_CANCELLED)
 		warn_iscsi(op, iscsi);
 	return 1;
@@ -1008,15 +1140,21 @@ int run_iscsi_event_loop(struct iscsi_context *iscsi, unsigned events)
 void add_output_chunk(struct chunk_st *chunk)
 {
 	unsigned i;
-	struct output_st *output = chunk->input->output;
+	struct output_st *output;
+	scsi_block_addr_t chunk_address;
 
 	/* Make room for $chunk in $output->tasks if it's full. */
+	output = chunk->input->output;
 	if (output->enqueued >= output->max)
 	{
 		unsigned n;
 
-		/* $output->tasks is either unallocated or we've used up
-		 * all the free entries.  Allocate it or 25% more. */
+		/*
+		 * $output->tasks is either unallocated or we've used up
+		 * all the free entries.  Allocate it or 25% more.  Do it
+		 * together with ->iov so we don't need to keep a separate
+		 * account of its size.
+		 */
 		n = output->max
 			? output->max + output->max/4
 			: Opt_max_output_queue;
@@ -1029,20 +1167,21 @@ void add_output_chunk(struct chunk_st *chunk)
 
 	/* Find a place for $chunk in $output->tasks in which buffers
 	 * are ordered by LBA. */
+	chunk_address = LBA_OF(chunk->task);
 	assert(output->enqueued < output->max);
 	for (i = output->enqueued; i > 0; i--)
-		if (LBA_OF(output->tasks[i-1]) < chunk->address)
+		if (LBA_OF(output->tasks[i-1]) < chunk_address)
 			break;
 
-	/* Insert $chunk->read_task into $output->tasks[$i]. */
+	/* Insert $chunk->task into $output->tasks[$i]. */
 	memmove(&output->tasks[i+1], &output->tasks[i],
 		sizeof(*output->tasks) * (output->enqueued - i));
-	output->tasks[i] = chunk->read_task;
-	chunk->read_task = NULL;
+	output->tasks[i] = chunk->task;
+	chunk->task = NULL;
 	output->enqueued++;
 
-	if (Last.writing < chunk->address)
-		Last.writing = chunk->address;
+	if (Last.writing < chunk_address)
+		Last.writing = chunk_address;
 
 	/* Return $chunk to the list of unused chunks. */
 	return_chunk(chunk);
@@ -1060,7 +1199,6 @@ int process_output_queue(int fd,
 	struct endpoint_st const *dst, struct output_st *output,
 	int more_to_come)
 {
-	int need_to_seek;
 	unsigned niov, ntasks;
 	scsi_block_addr_t block;
 	struct scsi_task **tasks, **from, **t;
@@ -1071,10 +1209,8 @@ int process_output_queue(int fd,
 	 * $tasks	:= where to take from the next buffer of the batch
 	 * $ntasks	:= how many buffers till the end of $output->tasks
 	 * $from	:= the first buffer in the batch
-	 * $need_to_seek := whether the current position of $fd is $first
 	 */
 	niov = 0;
-	need_to_seek = 0;
 	if (!(ntasks = output->enqueued))
 		return 0;
 	tasks = from = output->tasks;
@@ -1117,7 +1253,31 @@ int process_output_queue(int fd,
 			/* Fall through. */
 		} else if (LBA_OF(tasks[0]) < block)
 		{	/* Repeated/overlapping chunk, should not happen. */
-			assert(0);
+			size_t diff;
+			struct iovec *prev;
+
+			/* ...but it does sometimes for unknown reason. */
+			if (fd < 0)
+				continue;
+			diff = (size_t)dst->blocksize
+				* (block - LBA_OF(tasks[0]));
+			prev = &output->iov[niov-1];
+			assert(prev->iov_len > diff);
+
+			/* Verify that the buffers really overlap. */
+			assert(!memcmp(
+				&prev->iov_base + (prev->iov_len-diff),
+				tasks[0]->datain.data,
+				diff <= tasks[0]->datain.size
+					? diff : tasks[0]->datain.size));
+
+			/* Reduce the size of the $prev:ios buffer. */
+			if (Opt_verbosity > 0)
+				warn("server returned +%zu unexpected data "
+					"for block %u",
+					diff, LBA_OF(tasks[-1]));
+			prev->iov_len -= diff;
+			continue;
 		} else if (LBA_OF(tasks[0]) == block)
 		{	/* Found the next buffer in $output->tasks. */
 			continue;
@@ -1133,11 +1293,6 @@ int process_output_queue(int fd,
 			niov = 0;
 			block = LBA_OF(from[0]);
 
-			/* Since there's a gap between the previous and this
-			 * new batch we need to seek to $first when flushing
-			 * the new batch. */
-			need_to_seek = 1;
-
 			/* Go gather buffers. */
 			continue;
 		} else	/* The batch we could possibly output is too small,
@@ -1151,12 +1306,17 @@ int process_output_queue(int fd,
 			/* We would have flushed something. */
 			return 1;
 
-		/* Write the buffers to $fd. */
+		/* Write the buffers to $fd.  If $dst is $seekable always
+		 * use pwrite[v](), because practically we're writing buffers
+		 * in arbitrary order. */
 		assert(tasks > from);
 		if (!xpwritev(fd, output->iov, niov,
-				(off_t)dst->blocksize * LBA_OF(from[0]),
-				need_to_seek))
-			die("%s: %m", dst->fname ? dst->fname : "(stdout)");
+			(off_t)dst->blocksize * LBA_OF(from[0]),
+			dst->seekable))
+		{
+			warn("%s: %m", dst->fname ? dst->fname : "(stdout)");
+			return 0;
+		}
 
 		/* Delete output buffers [$from..$tasks[. */
 		for (t = from; t < tasks; t++)
@@ -1179,9 +1339,6 @@ int process_output_queue(int fd,
 		if (!dst->seekable && block != Last.written + 1)
 			/* The next $block is not the subsequent one. */
 			break;
-
-		/* Keep $need_to_seek, because pwrite*() doesn't change
-		 * the file offset. */
 		niov = 0;
 	} /* until all batches are output or skipped */
 
@@ -1199,35 +1356,35 @@ void chunk_written(struct iscsi_context *iscsi, int status,
 
 	assert(task != NULL);
 	assert(chunk != NULL);
-
-	if (!LOCAL_TO_REMOTE(input))
-	{
-		assert(REMOTE_TO_REMOTE(input));
-		assert(chunk->read_task);
-	}
+	assert(chunk->task == task);
 
 	assert(input->output->nreqs > 0);
 	input->output->nreqs--;
 
-	if (is_iscsi_error(iscsi, task, "write10", status))
+	SET_TASK_PTR(task, SCSI_OPCODE_WRITE10);
+	if (status == SCSI_STATUS_CANCELLED)
 	{
-		scsi_free_scsi_task(task);
+		task->status = status;
+		return;
+	} else if (is_iscsi_error(iscsi, task, "write10", status))
+	{
 		chunk_failed(chunk);
 		return;
-	} else
-		scsi_free_scsi_task(task);
+	}
 
-	assert(chunk->address <= Last.writing);
+	assert(LBA_OF(task) <= Last.writing);
 	assert(Last.written <= Last.writing);
-	if (Last.written < chunk->address)
-		Last.written = chunk->address;
+	if (Last.written < LBA_OF(task))
+		Last.written = LBA_OF(task);
 
-	chunk->address = 0;
-	assert(!chunk->time_to_retry);
+	scsi_free_scsi_task(task);
+	chunk->task = NULL;
+	chunk->time_to_retry = 0;
 	if (REMOTE_TO_REMOTE(input))
 	{
-		scsi_free_scsi_task(chunk->read_task);
-		chunk->read_task = NULL;
+		assert(chunk->s.rtrbuf);
+		free(chunk->s.rtrbuf);
+		chunk->s.rtrbuf = NULL;
 	}
 	return_chunk(chunk);
 }
@@ -1235,77 +1392,124 @@ void chunk_written(struct iscsi_context *iscsi, int status,
 void chunk_read(struct iscsi_context *iscsi, int status,
 	void *command_data, void *private_data)
 {
+	scsi_block_addr_t chunk_address;
 	struct scsi_task *task = command_data;
 	struct chunk_st *chunk = private_data;
 	struct endpoint_st *dst = chunk->input->dst;
 
 	assert(chunk != NULL);
 	assert(!LOCAL_TO_REMOTE(chunk->input));
-	assert(!chunk->read_task);
+	assert(!chunk->s.rtrbuf);
 
 	assert(task != NULL);
-
-#ifdef LIBISCSI_API_VERSION
-	/* libiscsi won't need this pointer anymore, so we can use it
-	 * to store the task's scsi_read10_cdb.  This will be freed by
-	 * scsi_free_scsi_task() automagically. */
-	task->ptr = scsi_cdb_unmarshall(task, SCSI_OPCODE_READ10);
-#endif
-	assert(LBA_OF(task) == chunk->address);
+	assert(task == chunk->task);
 
 	assert(chunk->input->nreqs > 0);
 	chunk->input->nreqs--;
 
-	if (is_iscsi_error(iscsi, task, "read10", status))
+	/* libiscsi won't need this pointer anymore, so we can use it
+	 * to store the task's scsi_read10_cdb.  This will be freed by
+	 * scsi_free_scsi_task() automagically. */
+	SET_TASK_PTR(task, SCSI_OPCODE_READ10);
+
+	if (status == SCSI_STATUS_CANCELLED)
+	{	/* restart_requests() cancelled us.  Set the $task->status
+		 * so restart_requests() won't cancel us again.  It'll also
+		 * influence chunk_dir(). */
+		task->status = status;
+		return;
+	} else if (is_iscsi_error(iscsi, task, "read10", status))
 	{
-		scsi_free_scsi_task(task);
 		chunk_failed(chunk);
 		return;
 	}
 
-	assert(chunk->address <= Last.reading);
+	chunk_address = LBA_OF(task);
+	assert(chunk_address <= Last.reading);
 	assert(Last.red <= Last.reading);
-	if (Last.red < chunk->address)
-		Last.red = chunk->address;
+	if (Last.red < chunk_address)
+		Last.red = chunk_address;
 
-	chunk->read_task = task;
-	assert(!chunk->time_to_retry);
 	if (REMOTE_TO_LOCAL(chunk->input))
 	{
+		chunk->time_to_retry = 0;
 		add_output_chunk(chunk);
 		return;
+	} else
+	{
+		assert(REMOTE_TO_REMOTE(chunk->input));
+		assert(!chunk->s.rtrbuf);
+
+		chunk->sbuf = task->datain.size;
+		chunk->s.rtrbuf = task->datain.data;
+		task->datain.data = NULL;
 	}
 
-	assert(REMOTE_TO_REMOTE(chunk->input));
 	if (chunk->input->src->blocksize != dst->blocksize)
 	{	/* Translate source address to destination address. */
 		off_t n;
 
-		n = (off_t)chunk->address * chunk->input->src->blocksize;
+		n = (off_t)chunk_address * chunk->input->src->blocksize;
 		assert(n % dst->blocksize == 0);
-		chunk->address = n / dst->blocksize;
+		chunk_address = n / dst->blocksize;
 	}
 
 	if (!(chunk->input->output->nreqs < chunk->input->dst->maxreqs))
 	{	/* Maximum outstanding write requests reached,
 		 * write $chunk later. */
-		chunk_failed(chunk);
+		retry_chunk(chunk);
 		return;
 	}
 
-	if (Last.writing < chunk->address)
-		Last.writing = chunk->address;
-
-	if (!write_endpoint(dst, chunk->address,
-		task->datain.data, task->datain.size,
-		chunk_written, chunk))
+	/* Don't trash $chunk->task until we have a new one. */
+	task = write_endpoint(dst, chunk_address,
+		chunk->s.rtrbuf, chunk->sbuf, chunk_written, chunk);
+	if (task != NULL)
+	{
+		if (Last.writing < chunk_address)
+			Last.writing = chunk_address;
+		scsi_free_scsi_task(chunk->task);
+		chunk->task = task;
+		chunk_started(chunk);
+		chunk->input->output->nreqs++;
+	} else
 	{
 		warn_iscsi("write10", dst->iscsi);
-		die(NULL);
-	} else
-		chunk->input->output->nreqs++;
+		retry_chunk(chunk);
+	}
 }
 #endif /* SEXYCAT */
+
+enum scsi_xfer_dir chunk_dir(struct chunk_st const *chunk)
+{
+	struct input_st const *input;
+
+	input = chunk->input;
+	assert(input != NULL);
+	assert(chunk->task != NULL);
+
+	if (chunk->task->status == SCSI_STATUS_GOOD)
+		/* Can be restarted without increasing
+		 * the number of outstanding requests. */
+		return chunk->task->xfer_dir;
+	else if (chunk->task->xfer_dir == SCSI_XFER_READ)
+	{	/* Re-read */
+		assert(!LOCAL_TO_REMOTE(input) && !chunk->s.rtrbuf);
+		assert(input->src && input->src->iscsi);
+		if (!(input->nreqs < input->src->maxreqs))
+			return SCSI_XFER_NONE;
+	} else	/* SCSI_XFER_WRITE */
+	{	/* Rewrite */
+		assert(!REMOTE_TO_LOCAL(input));
+		assert(LOCAL_TO_REMOTE(input) || chunk->s.rtrbuf);
+		assert(input->dst && input->dst->iscsi);
+		if (!(input->output->nreqs < input->dst->maxreqs))
+			return SCSI_XFER_NONE;
+	}
+
+	/* New request can be and needs to be started. */
+	return chunk->task->xfer_dir;
+}
 
 /* Return the optimal number of bytes to read/write [$from..$until[ blocks
  * taking the target's optimal transfer size and granuality into account. */
@@ -1372,104 +1576,129 @@ size_t read_chunk_size(
 int restart_requests(struct input_st *input,
 	callback_t read_cb, callback_t write_cb)
 {
-	struct chunk_st *prev, *chunk, *next;
+	struct chunk_st *chunk, *next;
 	struct output_st *output = input->output;
 	struct endpoint_st *src = input->src;
 	struct endpoint_st *dst = input->dst;
 
 	/* Do we have anything to do? */
-	if (!(chunk = input->failed))
+	if (!(chunk = input->in_use))
 		return 1;
 
-	/* Can we send any requests at all? */
-	if (!(input->nreqs < src->maxreqs || output->nreqs < dst->maxreqs))
-		return 1;
-
-	prev = NULL;
+	/* As long as we have requests which have reached $time_to_retry. */
 	do
-	{	/* As long as we have failed requests which have reached
-		 * $time_to_retry.  Since the list is ordered, the first time
-		 * we meet a $chunk still not ready to retry, we can stop. */
+	{
+		int timeout;
+		struct scsi_task *task;
+		scsi_block_addr_t chunk_address;
+
+		/* Since the list is ordered, the first time we meet a $chunk
+		 * still not ready to retry, we can stop. */
 		if (chunk->time_to_retry)
 			break;
+		assert(chunk->task != NULL);
+		timeout = chunk->task->status == SCSI_STATUS_GOOD;
 
-		/* Reissue the failed request if possible. */
+		/* We might modify the chain. */
 		next = chunk->next;
-		if (!LOCAL_TO_REMOTE(input) && !chunk->read_task)
+
+		/* Reissue the failed or timed out request if possible. */
+		switch (chunk_dir(chunk))
+		{
+		case SCSI_XFER_READ:
 		{	/* Re-read */
+			/* First we need to cancel the task and make the
+			 * callback set $task->ptr, otherwise LBA_OF()
+			 * won't work. */
+			if (timeout)
+				assert(!iscsi_scsi_cancel_task(
+						input->src->iscsi,
+						chunk->task));
 			if (!(input->nreqs < src->maxreqs))
-			{	/* Max number of reqs reached. */
-				prev = chunk;
+				/* This could be cause by reduce_maxreqs(). */
 				continue;
+			chunk_address = LBA_OF(chunk->task);
+
+			if (Opt_verbosity > 0)
+			{
+				if (timeout)
+					warn("source block #%u timed out, "
+						"re-reading", chunk_address);
+				else
+					warn("re-reading source block %u",
+						chunk_address);
 			}
 
-			if (Opt_verbosity > 1)
-				info("re-reading source block %u",
-					chunk->address);
-			if (!read_endpoint(src, chunk->address,
+			task = read_endpoint(src, chunk_address,
 				read_chunk_size(src, dst,
-					chunk->address, input->until),
-				read_cb, chunk))
-			{	/* It must be some fatal error, eg. OOM. */
+					chunk_address, input->until),
+				read_cb, chunk);
+			if (task != NULL)
+			{
+				scsi_free_scsi_task(chunk->task);
+				chunk->task = task;
+				chunk_started(chunk);
+				input->nreqs++;
+			} else
+			{
+				chunk->task->status = SCSI_STATUS_ERROR;
 				warn_iscsi("read10", src->iscsi);
 				return 0;
-			} else
-				input->nreqs++;
-		} else	/* LOCAL_TO_REMOTE() || $chunk->read_task */
+			}
+			break;
+		} case SCSI_XFER_WRITE:
 		{	/* Rewrite */
 			size_t sbuf;
 			unsigned char const *buf;
 
-			assert(!REMOTE_TO_LOCAL(input));
+			if (timeout)
+				assert(!iscsi_scsi_cancel_task(
+						input->dst->iscsi,
+						chunk->task));
 			if (!(output->nreqs < dst->maxreqs))
-			{	/* Max number of reqs reached. */
-				prev = chunk;
 				continue;
+			chunk_address = LBA_OF(chunk->task);
+
+			if (Opt_verbosity > 0)
+			{
+				if (timeout)
+					warn("destination block #%u "
+						"timed out, re-writing",
+						chunk_address);
+				else
+					warn("rewriting destination block %u",
+						chunk_address);
 			}
 
-			if (Opt_verbosity > 1)
-				info("rewriting source block %u",
-					chunk->address);
-
+			sbuf = chunk->sbuf;
 			if (IS_SEXYWRAP(input))
-			{	/* $buf points to some user buffer. */
-				buf  = chunk->u.wbuf;
-				sbuf = chunk->sbuf;
-			} else if (LOCAL_TO_REMOTE(input))
-			{	/* In this mode the buffer comes right after
-				 * the struct chunk_st. */
-				buf  = chunk->u.rbuf;
-				sbuf = chunk->sbuf;
-			} else
-			{	/* REMOTE_TO_REMOTE() */
-				buf  = chunk->read_task->datain.data;
-				sbuf = chunk->read_task->datain.size;
-			}
+				buf = chunk->s.wrpbuf;
+			else if (REMOTE_TO_REMOTE(input))
+				buf = chunk->s.rtrbuf;
+			else /* LOCAL_TO_REMOTE() */
+				buf = chunk->ltrbuf;
 
-			if (!write_endpoint(dst,
-				chunk->address, buf, sbuf,
-				write_cb, chunk))
-			{	/* Uncorrectable error. */
+			task = write_endpoint(dst,
+				chunk_address, buf, sbuf,
+				write_cb, chunk);
+			if (task != NULL)
+			{
+				scsi_free_scsi_task(chunk->task);
+				chunk->task = task;
+				chunk_started(chunk);
+				output->nreqs++;
+			} else
+			{
+				chunk->task->status = SCSI_STATUS_ERROR;
 				warn_iscsi("write10", dst->iscsi);
 				return 0;
-			} else
-				output->nreqs++;
+			}
+			break;
+		} default:
+			/* Chunk cannot be re-read or rewritten because
+			 * the maximum number of requests has reached. */
+			break;
 		} /* what to do with $chunk */
-
-		/* Unlink $chunk from the $failed chain and update $prev,
-		 * $input->failed and $input->last_failed. */
-		chunk->next = NULL;
-		if (!prev)
-		{	/* $chunk is the first in the list. */
-			assert(chunk == input->failed);
-			input->failed = next;
-		} else
-		{
-			assert(chunk != input->failed);
-			prev->next = next;
-		}
-		if (chunk == input->last_failed)
-			input->last_failed = prev;
 	} while ((chunk = next) != NULL);
 
 	return 1;
@@ -1481,35 +1710,32 @@ int start_iscsi_read_requests(struct input_st *input, callback_t read_cb)
 
 	/* Issue new read requests as long as we can. */
 	assert(!LOCAL_TO_REMOTE(input));
-	while (input->unused
-		&& input->nreqs < src->maxreqs
+	while (input->nreqs < src->maxreqs
 		&& input->top_block < input->until)
 	{
 		struct chunk_st *chunk;
 		size_t this_chunk_size;
 
-		chunk = input->unused;
-		assert(!chunk->read_task);
-		assert(!chunk->time_to_retry);
+		if (!(chunk = get_chunk(input)))
+			break;
 
 		this_chunk_size = read_chunk_size(src, input->dst,
 			input->top_block, input->until);
-		if (!read_endpoint(src, input->top_block,
-			this_chunk_size, read_cb, chunk))
+		if (!(chunk->task = read_endpoint(src, input->top_block,
+			this_chunk_size, read_cb, chunk)))
 		{
+			return_chunk(chunk);
 			warn_iscsi("read10", src->iscsi);
 			return 0;
+		} else
+		{
+			chunk_started(chunk);
+			input->nreqs++;
 		}
 
-		chunk->address = input->top_block;
+		assert(!Last.reading || Last.reading < input->top_block);
+		Last.reading = input->top_block;
 		input->top_block += this_chunk_size / src->blocksize;
-
-		assert(!Last.reading || Last.reading < chunk->address);
-		Last.reading = chunk->address;
-
-		/* Detach $chunk from $input->unused. */
-		input->nreqs++;
-		take_chunk(chunk);
 	} /* read until no more $input->unused chunks left */
 
 	return 1;
@@ -1526,8 +1752,10 @@ void free_chunks(struct chunk_st *chunk)
 		struct chunk_st *next;
 
 		next = chunk->next;
-		if (REMOTE_TO_REMOTE(chunk->input) && chunk->read_task)
-			scsi_free_scsi_task(chunk->read_task);
+		if (chunk->task)
+			scsi_free_scsi_task(chunk->task);
+		if (REMOTE_TO_REMOTE(chunk->input))
+			free(chunk->s.rtrbuf);
 		free(chunk);
 		chunk = next;
 	}
@@ -1550,7 +1778,7 @@ void free_surplus_unused_chunks(struct input_st *input)
 	{
 		chunk = input->unused;
 		assert(chunk != NULL);
-		assert(LOCAL_TO_REMOTE(chunk->input) || !chunk->read_task);
+		assert(LOCAL_TO_REMOTE(chunk->input) || !chunk->s.rtrbuf);
 		input->unused = chunk->next;
 		free(chunk);
 		input->nunused--;
@@ -1584,55 +1812,298 @@ void reduce_maxreqs(struct endpoint_st *endp)
 			endp->which, endp->maxreqs);
 }
 
+/* Return a $chunk (either floating or being in use) to $input->unused. */
 void return_chunk(struct chunk_st *chunk)
 {
 	struct input_st *input = chunk->input;
 
+	assert(!chunk->task);
+	assert(!chunk->time_to_retry);
+	if (IS_SEXYWRAP(input) || !LOCAL_TO_REMOTE(input))
+		assert(!chunk->s.wrpbuf && !chunk->s.rtrbuf);
+
+	if (chunk == input->last_in_use)
+	{	/* $chunk is the last one in the chain */
+		assert(!chunk->next);
+		input->last_in_use = chunk->prev;
+	}
+
+	if (chunk == input->in_use)
+	{	/* $chunk is the first and possibly last too */
+		assert(!chunk->prev);
+		input->in_use = chunk->next;
+	} else if (chunk->prev)
+		/* $chunk is not the first, but possibly the last */
+		chunk->prev->next = chunk->next;
+
+	if (chunk->next)
+		chunk->next->prev = chunk->prev;
+	chunk->prev = NULL;
+
+	/* Prepend $chunk to the unused chain. */
 	chunk->next = input->unused;
 	input->unused = chunk;
 	input->nunused++;
-}
+} /* return_chunk */
 
-void take_chunk(struct chunk_st *chunk)
+/* Verify the integrity of input_st::in_use before and after modification. */
+#define VERIFY_LIST
+
+/* Either enqueue a floating chunk (not $in_use) or requeue one
+ * with a new $timeout. */
+void enqueue_chunk(struct chunk_st *chunk, int status, unsigned timeout)
 {
 	struct input_st *input = chunk->input;
 
-	assert(chunk == input->unused);
-	assert(input->nunused > 0);
-	input->nunused--;
-	input->unused = chunk->next;
-	chunk->next = NULL;
-}
-
-/* Append $chunk to $input->failed. */
-void chunk_failed(struct chunk_st *chunk)
-{
-	struct input_st *input = chunk->input;
-
-	assert(!chunk->next);
-
-	if (!input->failed)
-	{
-		assert(!input->last_failed);
-		input->failed = chunk;
+#ifdef VERIFY_LIST
+	/* Verify the integrity of the $in_use chain beforehand. */
+	unsigned nchunks = 0;
+	if (!input->in_use)
+	{	/* Nothing is $in_use => $chunk must be floating. */
+		nchunks++;
+		assert(!input->last_in_use);
+		assert(!chunk->prev && !chunk->next);
 	} else
 	{
-		assert(input->last_failed);
-		assert(!input->last_failed->next);
-		input->last_failed->next = chunk;
-	}
+		int find_it;
+		struct chunk_st const *ch;
 
-	input->last_failed = chunk;
-	chunk->time_to_retry = Opt_request_retry_time;
+		/* If $chunk is not floating, $find_it. */
+		find_it = chunk == input->in_use||chunk->prev||chunk->next;
+		if (!find_it)
+			/* We'll add a new chunk. */
+			nchunks++;
+
+		assert(!input->in_use->prev);
+		for (ch = input->in_use; ; ch = ch->next)
+		{
+			nchunks++;
+			if (ch == chunk)
+			{
+				assert(find_it);
+				find_it = 0;
+			}
+			if (ch->next)
+			{	/* Verify that $ch:unks are ordered
+				 * by $time_to_retry ascendingly. */
+				assert(ch->time_to_retry
+					<= ch->next->time_to_retry);
+				assert(ch->next->prev == ch);
+			} else
+				break;
+		} /* for all $ch:unks $in_use */
+		assert(ch == input->last_in_use);
+		assert(!find_it);
+	} /* there are chunks $in_use */
+#endif /* VERIFY_LIST */
+
+	assert(chunk->task != NULL);
+	chunk->task->status = status;
+
+	if (!input->in_use)
+	{	/* $chunk will be the first to be in-use,
+		 * so it must be floating. */
+		assert(!chunk->prev);
+		assert(!chunk->next);
+		input->in_use = input->last_in_use = chunk;
+	} else if (timeout <= input->in_use->time_to_retry)
+	{	/* $chunk comes before the first one in the chain. */
+		if (chunk == input->in_use)
+		{	/* It's in the right place already. */
+			goto done;
+		} else if (!chunk->prev)
+		{	/* $chunk is floating, NOP */
+			assert(!chunk->next);
+		} else if (chunk == input->last_in_use)
+		{	/* $chunk is the last, but not the first $in_use */
+			input->last_in_use = chunk->prev;
+			input->last_in_use->next = NULL;
+		} else
+		{	/* $chunk is neither the first nor the last one,
+			 * simply unlink it */
+			chunk->prev->next = chunk->next;
+			chunk->next->prev = chunk->prev;
+		}
+
+		/* Prepend $in_use with $chunk. */
+		chunk->prev = NULL;
+		chunk->next = input->in_use;
+		input->in_use->prev = chunk;
+		input->in_use = chunk;
+	} else if (timeout >= input->last_in_use->time_to_retry)
+	{	/* $chunk expires after the last one in the chain. */
+		if (chunk == input->last_in_use)
+		{	/* It's in the right place already. */
+			goto done;
+		} else if (!chunk->next)
+		{	/* $chunk is floating, NOP */
+			assert(!chunk->prev);
+		} else if (chunk == input->in_use)
+		{	/* $chunk is the first, but not the last $in_use */
+			input->in_use = chunk->next;
+			input->in_use->prev = NULL;
+		} else
+		{	/* $chunk is neither the first nor the last one */
+			chunk->prev->next = chunk->next;
+			chunk->next->prev = chunk->prev;
+		}
+
+		/* Append $chunk to $in_use. */
+		chunk->next = NULL;
+		chunk->prev = input->last_in_use;
+		input->last_in_use->next = chunk;
+		input->last_in_use = chunk;
+	} else if (timeout != chunk->time_to_retry)
+	{	/* There must be >= 2 chunks $in_use. */
+		struct chunk_st *prec;
+
+		/* $chunk could still be the first or the last $in_use,
+		 * or it could be floating. */
+		assert(input->in_use != input->last_in_use);
+		assert(timeout > input->in_use->time_to_retry);
+		assert(timeout < input->last_in_use->time_to_retry);
+
+		/* Where to place $chunk? */
+		if (timeout < chunk->time_to_retry)
+		{	/*
+			 * We'll move $chunk backwards.  This case it can't
+			 * be the first $in_use because that situation has
+			 * been covered earlier.  Also $chunk cannot be
+			 * floating because then $time_to_retry would be 0.
+			 */
+			assert(chunk != input->in_use);
+			prec = chunk;
+		} else if (!chunk->next || timeout>chunk->next->time_to_retry)
+			/* We'll move $chunk forward, or insert it probably
+			 * at the end of the list. */
+			prec = input->last_in_use;
+		else	/* $time_to_retry < $timeout <= $next->time_to_retry
+			 * $timeout is increasing, but the position of $chunk
+			 * stays the same. */
+			goto done;
+
+		do
+		{
+			prec = prec->prev;
+			assert(prec != NULL);
+		} while (prec->time_to_retry > timeout);
+
+		/* Insert $chunk right after $prec. */
+		if (prec == chunk->prev || prec == chunk)
+		{	/* $chunk is in the right place already. */
+			goto done;
+		} else if (chunk == input->in_use)
+		{
+			assert(!chunk->prev);
+			assert(chunk->next != NULL);
+			input->in_use = chunk->next;
+			input->in_use->prev = NULL;
+		} else if (chunk == input->last_in_use)
+		{
+			assert(!chunk->next);
+			assert(chunk->prev != NULL);
+			input->last_in_use = chunk->prev;
+			input->last_in_use->next = NULL;
+		} else if (chunk->prev)
+		{	/* $chunk is not floating, unlink it */
+			chunk->prev->next = chunk->next;
+			chunk->next->prev = chunk->prev;
+		}
+
+		chunk->prev = prec;
+		chunk->next = prec->next;
+		prec->next->prev = chunk;
+		prec->next = chunk;
+	} else	/* $chunk is not floating and its $timeout and consequently
+		 * its place doesn't change. */
+		assert(chunk->prev || chunk->next);
+
+done:	chunk->time_to_retry = timeout;
+
+#ifdef VERIFY_LIST
+	/* Verify the integrity of the $in_use chain after modification. */
+	{
+		int found_it;
+		struct chunk_st const *ch;
+
+		found_it = 0;
+		assert(!input->in_use->prev);
+		for (ch = input->in_use; ; ch = ch->next)
+		{
+			assert(nchunks > 0);
+			nchunks--;
+
+			if (ch == chunk)
+			{
+				assert(!found_it);
+				found_it = 1;
+			}
+
+			if (ch->next)
+			{
+				assert(ch->time_to_retry
+					<= ch->next->time_to_retry);
+				assert(ch->next->prev == ch);
+			} else
+				break;
+		} /* for all $ch:unks $in_use */
+		assert(ch == input->last_in_use);
+		assert(found_it);
+		assert(!nchunks);
+	}
+#endif /* VERIFY_LIST */
+} /* enqueue_chunk */
+
+void retry_chunk(struct chunk_st *chunk)
+{
+	enqueue_chunk(chunk, SCSI_STATUS_GOOD, Opt_request_retry_time);
 }
 
-/* Free resources allocated by init_input().  $errno is preserved. */
+void chunk_failed(struct chunk_st *chunk)
+{
+	enqueue_chunk(chunk, SCSI_STATUS_ERROR, Opt_request_retry_time);
+}
+
+void chunk_started(struct chunk_st *chunk)
+{
+	enqueue_chunk(chunk, SCSI_STATUS_GOOD, Opt_request_timeout);
+}
+
+/* Return a $chunk from $input->unused or allocate a new one. */
+struct chunk_st *get_chunk(struct input_st *input)
+{
+	struct chunk_st *chunk;
+
+	/* In future we might create new chunks if none is unused,
+	 * but it didn't seem to improve throughput. */
+	if (!input->unused)
+		return NULL;
+
+	chunk = input->unused;
+	input->unused = chunk->next;
+	chunk->next = NULL;
+	assert(!chunk->prev);
+
+	assert(input->nunused > 0);
+	input->nunused--;
+
+	assert(chunk->input == input);
+	assert(!chunk->task);
+	assert(!chunk->time_to_retry);
+	if (IS_SEXYWRAP(input) || !LOCAL_TO_REMOTE(input))
+		assert(!chunk->s.wrpbuf && !chunk->s.rtrbuf);
+
+	return chunk;
+} /* get_chunk */
+
+/* Free resources allocated by init_input() or start_iscsi_read_requests().
+ * $errno is preserved. */
 void done_input(struct input_st *input)
 {
 	free_chunks(input->unused);
-	free_chunks(input->failed);
-	input->unused = input->failed = NULL;
-}
+	free_chunks(input->in_use);
+	input->unused = input->in_use = NULL;
+} /* done_input */
 
 /* Initialize $input with $src, $dst and $output, and allocate the right
  * number of $input->input chunks.  Either of $src or $dst can be NULL.
@@ -1654,12 +2125,14 @@ int init_input(struct input_st *input, struct output_st *output,
 	 * is the optimal transfer size of the destination device. */
 	max_chunk_size = sizeof(*chunk);
 	if (!IS_SEXYWRAP(input) && LOCAL_TO_REMOTE(input))
-	{	/* Discount sizeof(wbuf). */
-		max_chunk_size -= sizeof(chunk->u);
+	{	/* Discount sizeof(s). */
+		max_chunk_size -= sizeof(chunk->s);
 		max_chunk_size += (size_t)dst->blocksize * dst->optimum;
 	}
 
-	/* Create $input->input chunks. */
+	/* Create $input->input chunks.  This is just the initial number
+	 * of chunks, get_chunk() could in theory allocate more if all
+	 * the available chunks are failed for example. */
 	nchunks = 0;
 	if (src && src->iscsi)
 		nchunks += src->maxreqs;
@@ -1678,15 +2151,9 @@ int init_input(struct input_st *input, struct output_st *output,
 		return_chunk(chunk);
 	} /* until $nchunks unused chunks are created */
 
-	/* These are zero when the program starts... */
+	/* $Last needs to be reset if sexywrap uses us more than once. */
 	if (IS_SEXYWRAP(input))
-	{	/* ...but need to be cleared again when sexywrap
-		 * uses us the next time. */
-		memset(&Prev, 0, sizeof(Prev));
 		memset(&Last, 0, sizeof(Last));
-		memset(&Last_report, 0, sizeof(Last_report));
-		memset(&Now, 0, sizeof(Now));
-	}
 
 	return 1;
 } /* init_input */
@@ -1698,42 +2165,111 @@ void endpoint_connected(struct iscsi_context *iscsi, int status,
 	*connected = status == SCSI_STATUS_GOOD;
 }
 
-int connect_endpoint(struct iscsi_context *iscsi, struct iscsi_url *url)
+int connect_endpoint(struct iscsi_context *iscsi, struct iscsi_url *url,
+	int reserve)
 {
-	int connected;
+	unsigned ntries;
 
 	iscsi_set_targetname(iscsi, url->target);
 	iscsi_set_session_type(iscsi, ISCSI_SESSION_NORMAL);
 
-	connected = -1;
-	if (iscsi_full_connect_async(iscsi, url->portal, url->lun,
-		endpoint_connected, &connected) != 0)
-	{
-		warn_iscsi("connect", iscsi);
-		return 0;
-	}
-
-	do
+	ntries = 0;
+	for (;;)
 	{
 		struct pollfd pfd;
+		int ret, connected;
 
-		pfd.fd = iscsi_get_fd(iscsi);
+		connected = -1;
+		if (iscsi_full_connect_async(iscsi, url->portal, url->lun,
+			endpoint_connected, &connected) != 0)
+		{
+			warn_iscsi("connect", iscsi);
+			return -1;
+		}
+
+repoll:		pfd.fd = iscsi_get_fd(iscsi);
 		pfd.events = iscsi_which_events(iscsi);
-		if (!xpoll(&pfd, MEMBS_OF(&pfd)))
+		if ((ret = xfpoll(&pfd, MEMBS_OF(&pfd), NULL)) < 0)
 		{
 			warn_errno("poll");
-			return 0;
-		} else if (!run_iscsi_event_loop(iscsi, pfd.revents))
-		{	/* run_iscsi_event_loop() has logged the error. */
-			return 0;
-		} else if (!connected)
+			return -1;
+		} else if (ret > 0)
 		{
-			warn("connect: %s: %s: %s",
-				url->portal, url->target,
-				iscsi_get_error(iscsi));
+			if (!run_iscsi_event_loop(iscsi, pfd.revents))
+			{	/* run_iscsi_event_loop() logged the error. */
+				if (!is_connection_error(iscsi, NULL,
+						pfd.revents))
+					return -1;
+			} else if (!connected)
+			{
+				char const *err;
+
+				err = iscsi_get_error(iscsi);
+				warn("connect: %s: %s: %s",
+					url->portal, url->target, err);
+
+				/*
+				 * Consider these fatal errors because they
+				 * cannot be correct by reconnection attempts.
+				 * Unfortunately we don't have access to the
+				 * scsi_task and to the sense key and ascq,
+				 * so we've got to check out the error string.
+				 */
+				if (strstr(err, "LOGICAL_UNIT_NOT_SUPPORTED"))
+					return -1;
+				if (strstr(err, "Target not found"))
+					return -1;
+			}
+			else if (connected < 0)
+				/* callback wasn't called */
+				goto repoll;
+			else	/* $connected > 0 */
+				break;
+		} else	/* Cancel timed out task. */
+			iscsi_scsi_cancel_all_tasks(iscsi);
+
+		/* Try hard to reconnect? */
+		if (!Opt_retry_connection.enabled)
 			return 0;
-		}
-	} while (connected < 0);
+		ntries++;
+		if (Opt_retry_connection.ntimes
+				&& ntries >= Opt_retry_connection.ntimes)
+			/* Maximum number of tries reached. */
+			return 0;
+		if (Opt_retry_connection.pause)
+		{
+			if (Opt_verbosity > 0)
+				warn("retrying in %u second(s)...",
+					Opt_retry_connection.pause);
+			sleep(Opt_retry_connection.pause);
+		} else if (Opt_verbosity > 0)
+			warn("retrying connection");
+
+		iscsi_disconnect(iscsi);
+	} /* until $connected */
+
+#ifdef LIBISCSI_API_VERSION
+	/* $reserve the LUN if requested.  This might help decrease spurious
+	 * RESERVATION CONFLICT errors (observed with EMC VNX 5300).
+	 * This function is not available in libiscsi 1.4.  */
+	if (reserve)
+	{
+		struct scsi_task *task;
+
+		if (Opt_verbosity > 0)
+			info("reserving LUN %u", url->lun);
+		if (!(task = iscsi_reserve6_sync(iscsi, url->lun)))
+		{
+			warn_iscsi("reserve6", iscsi);
+			return -1;
+		} else if (is_iscsi_error(iscsi, task, "read6", task->status))
+		{
+			scsi_free_scsi_task(task);
+			return -1;
+		} else
+			scsi_free_scsi_task(task);
+	}
+#endif /* ! LIBISCSI_API_VERSION */
 
 	return 1;
 }
@@ -1749,7 +2285,8 @@ int reconnect_endpoint(struct endpoint_st *endp)
 		warn_errno("iscsi_create_context()");
 		return 0;
 	} else
-		return connect_endpoint(endp->iscsi, endp->url);
+		return connect_endpoint(endp->iscsi, endp->url,
+			endp->reserve) > 0;
 }
 
 int run_endpoint(struct endpoint_st *endp, unsigned events)
@@ -1814,16 +2351,11 @@ void destroy_endpoint(struct endpoint_st *endp)
 {
 	if (endp->iscsi)
 	{
+		iscsi_destroy_url(endp->url);
 		iscsi_destroy_context(endp->iscsi);
 		endp->iscsi = NULL;
-	} else	/* This is actually $endp->fname. */
-		endp->url = NULL;
-
-	if (endp->url)
-	{
-		iscsi_destroy_url(endp->url);
-		endp->url = NULL;
 	}
+	endp->url = NULL;
 }
 
 /* Print the target's capacity and characteristics. */
@@ -1834,19 +2366,114 @@ void print_endpoint(struct endpoint_st const *endp)
 		endp->which, endp->nblocks, endp->blocksize,
 		endp->granuality, endp->optimum, endp->maximum);
 } /* print_endpoint */
+
+void set_endpoint_desired_optimum(struct endpoint_st *endp, char const *str)
+{
+	char *fend;
+	float f, i;
+
+	/* Any preference? */
+	if (!str)
+		return;
+
+	/* Bail out if $str cannot be parsed or if it's not a number
+	 * or it's too large, too close to 0, or is negative. */
+	errno = 0;
+	f = strtof(str, &fend);
+	if (fend == str	|| (f == 0 && errno != 0)
+	    		|| f == HUGE_VALF || f == -HUGE_VALF || f == NAN
+			|| f < 0)
+		goto out;
+
+	/* In what units is $f? */
+	if ((fend[0] == 'M' || fend[0] == 'm') && !fend[1])
+	{	/* $f is in megabytes */
+		f *= 1024.0 * 1024.0;
+	} else if ((fend[0] == 'K' || fend[0] == 'k') && !fend[1])
+	{	/* $f is in kilobytes */
+		f *= 1024.0;
+	} else if ((fend[0] == 'B' || fend[0] == 'b') && !fend[1])
+	{	/* $f is an exact number of bytes */
+		unsigned u;
+
+		/* Refuse non-integers. */
+		if (modff(f, &i) != 0.0)
+			goto out;
+		u = i;
+
+		/* Is it a multiple of the block size? */
+		if (u % endp->blocksize)
+			die("chunk size %u bytes is not a multiple "
+				"of the target's block size", u);
+		endp->optimum = u / endp->blocksize;
+		goto check_granuality;
+	} else if (fend[0] == '%' && !fend[1])
+	{	/* $f is a percentage of the target's optimum. */
+		if (f > 100.0)
+			goto out;
+		f *= endp->optimum;
+		f /= 100.0;
+	} else if (!fend[0])
+	{	/* $f is either the desired number of blocks (in which case
+		 * we don't have to do anything with it) or a fraction of
+		 * the optimum. */
+		if (f < 1.0)
+			f *= endp->optimum;
+	} else
+		goto out;
+
+	/* Zero means keep to the optimum in all cases. */
+	if (f == 0.0)
+		return;
+
+	if (fend[0] == '%' || !fend[0])
+	{	/* $f is either a fraction or an exact number of blocks. */
+		if (f < 1.0)
+			die("%s: chunk size too small", str);
+	} else
+	{	/* $f is in bytes, convert it to blocks */
+		if (f < endp->blocksize)
+			die("%s: chunk size too small", str);
+		f /= (float)endp->blocksize;
+	}
+
+	/* Truncate fractional block numbers. */
+	if (modff(f, &i) != 0.0)
+	{
+		warn("chunk size %s is not a multiply of the block size, "
+			"rounding down to %u blocks", str, (unsigned)i);
+		f = i;
+	} 
+
+	/* Make sure we don't overflow $endp->optimum. */
+	if (f >= (float)UINT_MAX)
+		die("%s: chunk size too large", str);
+	endp->optimum = f;
+
+check_granuality:
+	/* Is the determined desired optimum a multiple of the granuality? */
+	if (endp->granuality && endp->optimum % endp->granuality)
+		warn("chunk size %u is not a multiple "
+			"of the target's granuality", endp->optimum);
+	return;
+
+out:	die("%s: invalid chunk size", str);
+}
 #endif /* SEXYCAT */
 
 /* Calculate the optimal transfer size based on the target's preferences.
  * $endp is assumed to be initialized with stat_endpoint(). */
-void calibrate_endpoint(struct endpoint_st *endp,
-	scsi_block_count_t desired_optimum)
+void calibrate_endpoint(struct endpoint_st *endp, char const *desired_optimum)
 {
 	/* The fallback optimal transfer size in bytes. */
 	const size_t dflt_optimum = 1024*1024;
 
-	if (desired_optimum)
-		/* User gave a $desired_optimum, override the device's. */
-		endp->optimum = desired_optimum;
+#ifdef SEXYCAT
+	/* $desired_optimum comes from the command line. */
+	set_endpoint_desired_optimum(endp, desired_optimum);
+#else
+	assert(!desired_optimum);
+#endif
 
 	/*
 	 * Adjust $endp->optimum and $granuality, honoring $maximum
@@ -2008,6 +2635,8 @@ int stat_endpoint(struct endpoint_st *endp, unsigned fallback_blocksize)
 int init_endpoint(struct endpoint_st *endp, char const *url,
 	unsigned fallback_blocksize)
 {
+	int ret;
+
 	/* Create $endp->iscsi and connect to $endp->url. */
 	if (!(endp->iscsi = iscsi_create_context(endp->initiator)))
 	{
@@ -2018,8 +2647,16 @@ int init_endpoint(struct endpoint_st *endp, char const *url,
 		warn_iscsi(NULL, endp->iscsi);
 		destroy_endpoint(endp);
 		return 0;
-	} else if (!connect_endpoint(endp->iscsi, endp->url)
-		|| !stat_endpoint(endp, fallback_blocksize))
+	}
+
+	if (!(ret = connect_endpoint(endp->iscsi, endp->url, endp->reserve)))
+	{
+		if (Opt_retry_connection.enabled)
+			warn("connection to the %s target timed out",
+				endp->which);
+		destroy_endpoint(endp);
+		return 0;
+	} else if (ret < 0 || !stat_endpoint(endp, fallback_blocksize))
 	{
 		destroy_endpoint(endp);
 		return 0;
@@ -2058,14 +2695,15 @@ int local_to_remote(struct input_st *input)
 	for (;;)
 	{
 		int ret;
+		struct chunk_st *chunk;
 
-		/* Recreate failed iSCSI write requests,
+		/* Recreate failed or timed out iSCSI write requests,
 		 * but don't send them to $dst just yet. */
 		if (!restart_requests(input, NULL, chunk_written))
 			return 0;
 
 		/* Done if !pending && (eof || disk full) */
-		if (!input->output->nreqs && !input->failed)
+		if (!input->in_use)
 		{
 			if (eof)
 				break;
@@ -2074,37 +2712,43 @@ int local_to_remote(struct input_st *input)
 		}
 
 		/* POLLIN <=> !eof && can request && !disk full */
+		chunk = NULL;
 		pfd[0].events = !eof
-			&& input->unused
+			&& (input->output->nreqs < input->dst->maxreqs)
+			&& (chunk = get_chunk(input)) != NULL
 			&& (input->top_block < input->until)
 			? POLLIN : 0;
 		pfd[1].events = iscsi_which_events(dst->iscsi);
-		if ((ret = xfpoll(pfd, MEMBS_OF(pfd), input)) < 0)
+		if ((ret = xfpoll(pfd, MEMBS_OF(pfd), input)) <= 0)
 		{
-			warn_errno("poll");
-			return 0;
-		} else if (!ret)
+			if (ret < 0)
+				warn_errno("poll");
+			if (chunk)
+				return_chunk(chunk);
+			if (ret < 0)
+				return 0;
 			continue;
+		}
 
 		/* Read $src if we can and create an iSCSI write request. */
 		if (pfd[0].revents & POLLIN)
 		{	/* We must have been waiting for POLLIN. */
 			size_t max_chunk_size;
-			struct chunk_st *chunk;
 
 			/* $chunk <- read($src, $max_chunk_size) */
 			assert(pfd[0].events & POLLIN);
-			assert(input->unused != NULL);
-			chunk = input->unused;
+			assert(chunk != NULL);
 			max_chunk_size = read_chunk_size(NULL, dst,
 				input->top_block, input->until);
 			assert(max_chunk_size
 				<= (size_t)dst->blocksize * dst->optimum);
-			if (!xread(pfd[0].fd, chunk->u.rbuf,
+			if (!xread(pfd[0].fd, chunk->ltrbuf,
 				max_chunk_size, &chunk->sbuf))
-			{
+			{	/* A read() error is serious enough
+				   to terminate because of it. */
 				warn_errno(src->fname
 					? src->fname : "(stdin)");
+				return_chunk(chunk);
 				return 0;
 			} else if (chunk->sbuf % dst->blocksize > 0)
 			{	/* We can't write a partial block.
@@ -2119,34 +2763,42 @@ int local_to_remote(struct input_st *input)
 
 			/* Is it $eof on $src? */
 			if (chunk->sbuf > 0)
-			{	/* Remove $chunk from $input->unused. */
-				take_chunk(chunk);
-				chunk->address = input->top_block;
+			{	/* Not yet. */
+				scsi_block_addr_t chunk_address;
+
+				chunk_address = input->top_block;
 				input->top_block +=
 					chunk->sbuf / dst->blocksize;
 
-				/* We needn't check whether $dst->maxreqs is
-				 * exceeded, because this case we would have
-				 * been out of $input->unused chunks. */
-				assert(input->output->nreqs
-					< input->dst->maxreqs);
-
 				assert(!Last.writing
-					|| Last.writing < chunk->address);
-				Last.writing = chunk->address;
+					|| Last.writing < chunk_address);
 
 				/* Create the iSCSI write request. */
-				if (!write_endpoint(dst, chunk->address,
-					chunk->u.rbuf, chunk->sbuf,
-					chunk_written, chunk))
-				{
+				chunk->task = write_endpoint(dst,
+					chunk_address,
+					chunk->ltrbuf, chunk->sbuf,
+					chunk_written, chunk);
+				if (!chunk->task)
+				{	/* Unfortunately we can't re-read()
+					 * the buffer, so we can't send the
+					 * write request later. */
 					warn_iscsi("write10", dst->iscsi);
-					die(NULL);
+					return_chunk(chunk);
+					return 0;
 				} else
+				{
+					Last.writing = chunk_address;
+					chunk_started(chunk);
 					input->output->nreqs++;
-			} else /* We didn't read anything. */
+				}
+			} else
+			{	/* We didn't read anything. */
 				eof = 1;
-		} /* read from $src */
+				return_chunk(chunk);
+			}
+		} else if (chunk)
+			/* Not ready to read from $src after all. */
+			return_chunk(chunk);
 
 		/* Is EOF on $src reached? */
 		if (pfd[0].revents & (POLLHUP|POLLRDHUP))
@@ -2308,7 +2960,7 @@ int remote_to_local(struct input_st *input,
 			return 0;
 
 		/* Anything more to do? */
-		eof = !input->nreqs && !input->failed;
+		eof = !input->in_use;
 		if (eof && !input->output->enqueued)
 			break;
 
@@ -2381,7 +3033,7 @@ int remote_to_remote(struct input_st *input)
 			return 0;
 		if (!start_iscsi_read_requests(input, chunk_read))
 			return 0;
-		if (!input->nreqs && !input->output->nreqs && !input->failed)
+		if (!input->in_use)
 			break;
 
 		/* Wait until I/O is possible without blocking. */
@@ -2436,7 +3088,7 @@ int main(int argc, char *argv[])
 		};
 
 		size_t fallback_blocksize;
-		scsi_block_count_t desired_optimum;
+		char const *desired_optimum;
 
 		struct endpoint_st endp;
 	} src, dst;
@@ -2444,6 +3096,7 @@ int main(int argc, char *argv[])
 	struct output_st output;
 	char const *optstring;
 	int isok, optchar, nop, overwrite, check_free_space;
+	sigset_t alrm;
 
 	/* Initialize diagnostic output. */
 	Info = stdout;
@@ -2481,12 +3134,15 @@ int main(int argc, char *argv[])
 #else
 # define SEXYWRAP_CMDLINE			/* none */
 #endif
-	optstring = "hvqp:i:s:S:f:c:m:I:d:D:F:C:M:OVb:B:r:R:N"
+	optstring = "hVvqp:i:s:S:rc:m:z:I:d:D:RfFC:M:Z:b:B:t:T:H:Q:N"
 		SEXYWRAP_CMDLINE;
 
 	while ((optchar = getopt(argc, argv, optstring)) != EOF)
 		switch (optchar)
 		{
+		case 'V':
+			Opt_timestamp = 1;
+			break;
 		case 'v':
 			Opt_verbosity++;
 			break;
@@ -2518,17 +3174,20 @@ int main(int argc, char *argv[])
 			src.is_local = 1;
 			src.fname = optarg;
 			break;
-		case 'f':
-			src.fallback_blocksize = atoi(optarg);
-			dst.fallback_blocksize = src.fallback_blocksize;
+		case 'r':
+			src.endp.reserve = 1;
 			break;
 		case 'c':
-			src.desired_optimum = atoi(optarg);
-			dst.desired_optimum = src.desired_optimum;
+			src.desired_optimum = optarg;
+			dst.desired_optimum = optarg;
 			break;
 		case 'm':
 			src.endp.maxreqs = atoi(optarg);
 			dst.endp.maxreqs = src.endp.maxreqs;
+			break;
+		case 'z':
+			src.fallback_blocksize = atoi(optarg);
+			dst.fallback_blocksize = src.fallback_blocksize;
 			break;
 
 		/* Destination-related options */
@@ -2543,27 +3202,43 @@ int main(int argc, char *argv[])
 			dst.is_local = 1;
 			dst.fname = optarg;
 			break;
+		case 'R':
+			dst.endp.reserve = 1;
+			break;
+		case 'f':
+			check_free_space = 1;
+			break;
+		case 'F':
+			overwrite = 1;
+			break;
+		case 'C':
+			dst.desired_optimum = optarg;
+			break;
 		case 'M':
 			dst.endp.maxreqs = atoi(optarg);
 			break;
-		case 'F':
+		case 'Z':
 			dst.fallback_blocksize = atoi(optarg);
-			break;
-		case 'C':
-			dst.desired_optimum = atoi(optarg);
-			break;
-		case 'O':
-			overwrite = 1;
-			break;
-		case 'V':
-			check_free_space = 1;
 			break;
 
 		/* Error recovery */
-		case 'r':
+		case 't':
 			Opt_request_retry_time = atoi(optarg);
 			break;
-		case 'R':
+		case 'T':
+			Opt_request_timeout = atoi(optarg);
+			break;
+		case 'H':
+			Opt_retry_connection.enabled = 1;
+			if (sscanf(optarg, "%ux%u",
+				&Opt_retry_connection.pause,
+				&Opt_retry_connection.ntimes) != 2)
+			{
+				Opt_retry_connection.pause = atoi(optarg);
+				Opt_retry_connection.ntimes = 0;
+			}
+			break;
+		case 'Q':
 			Opt_maxreqs_degradation = atoi(optarg);
 			if (Opt_maxreqs_degradation > 100)
 				die("maximum iSCSI requests "
@@ -2647,6 +3322,10 @@ int main(int argc, char *argv[])
 
 	if (argc > optind)
 		die("too many arguments");
+#ifndef LIBISCSI_API_VERSION
+	if (src.endp.reserve || dst.endp.reserve)
+		die("can't reserve LUNs");
+#endif
 
 	/* Verify that we're not given two local targets. */
 	if (!src.url && !dst.url)
@@ -2677,17 +3356,22 @@ int main(int argc, char *argv[])
 	/* Make sure we have sane settings.  It's important to leave
 	 * local targets' maxreqs zero, because restart_requests()
 	 * depends on it. */
-	if (!src.is_local && !src.endp.maxreqs)
+	if (src.is_local)
+		src.endp.maxreqs = 0;
+	else if (!src.endp.maxreqs)
 		src.endp.maxreqs = DFLT_INITIAL_MAX_ISCSI_REQS;
-	if (!dst.is_local && !dst.endp.maxreqs)
+	if (dst.is_local)
+		dst.endp.maxreqs = 0;
+	else if (!dst.endp.maxreqs)
 		dst.endp.maxreqs = DFLT_INITIAL_MAX_ISCSI_REQS;
 	if (!Opt_min_output_batch)
 		Opt_min_output_batch = 1;
 	if (Opt_max_output_queue < Opt_min_output_batch)
 		Opt_max_output_queue = Opt_min_output_batch;
 
-	/* Init */
+	/* Init.  $Start is needed by warn*() quite early on. */
 	signal(SIGPIPE, SIG_IGN);
+	clock_gettime(CLOCK_MONOTONIC, &Start);
 	if (src.is_local)
 		/* LOCAL_TO_REMOTE() */
 		src.endp.fname = src.fname;
@@ -2767,10 +3451,8 @@ int main(int argc, char *argv[])
 
 		/* Set the desired chunk sizes before set_maximum(),
 		 * so they can be adjusted if needed. */
-		if (src.desired_optimum)
-			src.endp.optimum = src.desired_optimum;
-		if (dst.desired_optimum)
-			dst.endp.optimum = dst.desired_optimum;
+		set_endpoint_desired_optimum(&src.endp, src.desired_optimum);
+		set_endpoint_desired_optimum(&dst.endp, dst.desired_optimum);
 
 		/* Both endpoint's $maximum <- minimum($src, $dst). */
 		set_maximum(&src.endp, &dst.endp);
@@ -2788,8 +3470,8 @@ int main(int argc, char *argv[])
 				"please specify it manually with -cC");
 
 		/* Set up the $granuality of the endpoints. */
-		calibrate_endpoint(&src.endp, 0);
-		calibrate_endpoint(&dst.endp, 0);
+		calibrate_endpoint(&src.endp, NULL);
+		calibrate_endpoint(&dst.endp, NULL);
 
 		/* These conditions have to be met for read_chunk_size()
 		 * to choose a chunk size appropriate for both targets. */
@@ -2804,7 +3486,16 @@ int main(int argc, char *argv[])
 		die("malloc: %m");
 	input.until = LOCAL_TO_REMOTE(&input)
 		? dst.endp.nblocks : src.endp.nblocks;
-	clock_gettime(CLOCK_MONOTONIC, &Start);
+
+	/* Allow report_progress() only interrupt xfpoll(). */
+	sigemptyset(&alrm);
+	sigaddset(&alrm, SIGALRM);
+	if (Opt_progress)
+	{
+		sigprocmask(SIG_BLOCK, &alrm, NULL);
+		signal(SIGALRM, report_progress);
+		start_timer(Opt_progress);
+	}
 
 	/* Run */
 	if (nop)
@@ -2822,15 +3513,47 @@ int main(int argc, char *argv[])
 		isok = remote_to_remote(&input);
 
 	/* Done */
+	if (Opt_progress)
+		stop_timer();
+
 	if (isok)
 	{	/* If we're not $isok, the libiscsi context may be
 		 * in inconsistent state, better not to risk using
-		 * it anymore. */
-   		   if (src.endp.iscsi)
-			iscsi_logout_sync(src.endp.iscsi);
-		if (dst.endp.iscsi)
-			iscsi_logout_sync(dst.endp.iscsi);
-	}
+		 * it anymore.  Otherwise log out. */
+		jmp_buf jb;
+
+		/* SIGALRM handler. */
+		void nope(int unused)
+		{	/* Log the error and throw an exception. */
+			if (Opt_verbosity > 0)
+				warn("logout timed out");
+			longjmp(jb, 1);
+		}
+
+		/* Interrupt iscsi_logout_sync() in $Opt_request_timeout ms */
+		if (Opt_request_timeout)
+		{
+			signal(SIGALRM, nope);
+			sigprocmask(SIG_UNBLOCK, &alrm, NULL);
+			start_timer(Opt_request_timeout);
+		}
+
+		if (src.endp.iscsi
+		    		&& !setjmp(jb)
+				&& iscsi_logout_sync(src.endp.iscsi) != 0)
+			warn_iscsi("logout", src.endp.iscsi);
+		if (dst.endp.iscsi
+		    		&& !setjmp(jb)
+		    		&& iscsi_logout_sync(dst.endp.iscsi) != 0)
+			warn_iscsi("logout", dst.endp.iscsi);
+
+		/* Stop the timer. */
+		if (Opt_request_timeout)
+		{
+			stop_timer();
+			signal(SIGALRM, SIG_IGN);
+		}
+	} /* $isok */
 
 	/* Free resources */
 	done_input(&input);
