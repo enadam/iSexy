@@ -67,6 +67,7 @@ int main(int argc, char const *argv[])
 	argv++;
 
 	/* -m | -h */
+	max = 0;
 	usage(argv[1], 1);
 	if (!strcmp(argv[1], "-m"))
 	{
@@ -81,17 +82,6 @@ int main(int argc, char const *argv[])
 	usage(argv[1], 1);
 	url = argv[1];
 	argv++;
-
-#if 0
-	puts("OPEN 1");
-	assert((hiscsi = open(url, O_RDONLY)) >= 0);
-	puts("CLOSE 1");
-	assert(!close(hiscsi));
-	puts("\nOPEN 2");
-	assert((hiscsi = open(url, O_RDONLY)) >= 0);
-	puts("DONE 2");
-	return 0;
-#endif
 
 	/* <disk> */
 	usage(argv[1], 1);
@@ -133,7 +123,7 @@ int main(int argc, char const *argv[])
 		} else
 			disk = NULL;
 
-		/* open($url) and get/verify its size */
+		/* open($url) and get/verify its $size */
 		assert((hiscsi = open(url,
 			test == 'w' ? O_WRONLY : O_RDONLY)) >= 0);
 		assert(!fstat(hiscsi, &sb));
